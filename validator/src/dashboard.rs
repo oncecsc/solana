@@ -6,7 +6,8 @@ use {
     },
     solana_core::validator::ValidatorStartProgress,
     solana_sdk::{
-        clock::Slot, commitment_config::CommitmentConfig, native_token::Sol, pubkey::Pubkey,
+        clock::Slot, commitment_config::CommitmentConfig, exit::Exit, native_token::Sol,
+        pubkey::Pubkey,
     },
     std::{
         io,
@@ -31,7 +32,7 @@ impl Dashboard {
     pub fn new(
         ledger_path: &Path,
         log_path: Option<&Path>,
-        validator_exit: Option<&mut solana_core::validator::ValidatorExit>,
+        validator_exit: Option<&mut Exit>,
     ) -> Result<Self, io::Error> {
         println_name_value("Ledger location:", &format!("{}", ledger_path.display()));
         if let Some(log_path) = log_path {
@@ -63,7 +64,7 @@ impl Dashboard {
         } = self;
         drop(progress_bar);
 
-        let mut runtime = admin_rpc_service::runtime();
+        let runtime = admin_rpc_service::runtime();
         while !exit.load(Ordering::Relaxed) {
             let progress_bar = new_spinner_progress_bar();
             progress_bar.set_message("Connecting...");
@@ -107,18 +108,18 @@ impl Dashboard {
                     println_name_value("TPU Address:", &tpu.to_string());
                 }
                 if let Some(rpc) = contact_info.rpc {
-                    println_name_value("JSON RPC URL:", &format!("http://{}", rpc.to_string()));
+                    println_name_value("JSON RPC URL:", &format!("http://{}", rpc));
                 }
             }
 
             let progress_bar = new_spinner_progress_bar();
-            let mut snapshot_slot = None;
+            let mut snapshot_slot_info = None;
             for i in 0.. {
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
                 if i % 10 == 0 {
-                    snapshot_slot = rpc_client.get_snapshot_slot().ok();
+                    snapshot_slot_info = rpc_client.get_highest_snapshot_slot().ok();
                 }
 
                 match get_validator_stats(&rpc_client, &identity) {
@@ -146,7 +147,7 @@ impl Dashboard {
                         progress_bar.set_message(format!(
                             "{}{}{}| \
                                     Processed Slot: {} | Confirmed Slot: {} | Finalized Slot: {} | \
-                                    Snapshot Slot: {} | \
+                                    Full Snapshot Slot: {} | Incremental Snapshot Slot: {} | \
                                     Transactions: {} | {}",
                             uptime,
                             if health == "ok" {
@@ -162,9 +163,17 @@ impl Dashboard {
                             processed_slot,
                             confirmed_slot,
                             finalized_slot,
-                            snapshot_slot
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
+                            snapshot_slot_info
+                                .as_ref()
+                                .map(|snapshot_slot_info| snapshot_slot_info.full.to_string())
+                                .unwrap_or_else(|| '-'.to_string()),
+                            snapshot_slot_info
+                                .as_ref()
+                                .map(|snapshot_slot_info| snapshot_slot_info
+                                    .incremental
+                                    .map(|incremental| incremental.to_string()))
+                                .flatten()
+                                .unwrap_or_else(|| '-'.to_string()),
                             transaction_count,
                             identity_balance
                         ));
@@ -194,7 +203,7 @@ async fn wait_for_validator_startup(
         }
 
         if admin_client.is_none() {
-            match admin_rpc_service::connect(&ledger_path).await {
+            match admin_rpc_service::connect(ledger_path).await {
                 Ok(new_admin_client) => admin_client = Some(new_admin_client),
                 Err(err) => {
                     progress_bar.set_message(format!("Unable to connect to validator: {}", err));

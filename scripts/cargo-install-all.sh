@@ -4,6 +4,7 @@
 # other workspace crates or native program crates.
 here="$(dirname "$0")"
 readlink_cmd="readlink"
+echo "OSTYPE IS: $OSTYPE"
 if [[ $OSTYPE == darwin* ]]; then
   # Mac OS X's version of `readlink` does not support the -f option,
   # But `greadlink` does, which you can get with `brew install coreutils`
@@ -77,6 +78,7 @@ if [[ $CI_OS_NAME = windows ]]; then
     solana-install-init
     solana-keygen
     solana-stake-accounts
+    solana-test-validator
     solana-tokens
   )
 else
@@ -84,7 +86,6 @@ else
 
   BINS=(
     solana
-    solana-bench-exchange
     solana-bench-tps
     solana-faucet
     solana-gossip
@@ -106,7 +107,6 @@ else
       solana-dos
       solana-install-init
       solana-stake-accounts
-      solana-stake-monitor
       solana-test-validator
       solana-tokens
       solana-watchtower

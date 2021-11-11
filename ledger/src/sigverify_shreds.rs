@@ -312,7 +312,7 @@ fn sign_shred_cpu(keypair: &Keypair, packet: &mut Packet) {
     );
     let signature = keypair.sign_message(&packet.data[msg_start..msg_end]);
     trace!("signature {:?}", signature);
-    packet.data[0..sig_end].copy_from_slice(&signature.as_ref());
+    packet.data[0..sig_end].copy_from_slice(signature.as_ref());
 }
 
 pub fn sign_shreds_cpu(keypair: &Keypair, batches: &mut [Packets]) {
@@ -323,7 +323,7 @@ pub fn sign_shreds_cpu(keypair: &Keypair, batches: &mut [Packets]) {
         batches.par_iter_mut().for_each(|p| {
             p.packets[..]
                 .par_iter_mut()
-                .for_each(|mut p| sign_shred_cpu(keypair, &mut p));
+                .for_each(|p| sign_shred_cpu(keypair, p));
         });
     });
     inc_new_counter_debug!("ed25519_shred_verify_cpu", count);
@@ -364,7 +364,7 @@ pub fn sign_shreds_gpu(
 
     let mut elems = Vec::new();
     let offset: usize = pinned_keypair.len();
-    let num_keypair_packets = vec_size_in_packets(&pinned_keypair);
+    let num_keypair_packets = vec_size_in_packets(pinned_keypair);
     let mut num_packets = num_keypair_packets;
 
     //should be zero

@@ -7,19 +7,18 @@ use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use solana_core::banking_stage::{create_test_recorder, BankingStage, BankingStageStats};
-use solana_core::cost_model::CostModel;
-use solana_core::cost_tracker::CostTracker;
-use solana_core::poh_recorder::WorkingBankEntry;
+use solana_core::banking_stage::{BankingStage, BankingStageStats};
+use solana_entry::entry::{next_hash, Entry};
 use solana_gossip::cluster_info::ClusterInfo;
 use solana_gossip::cluster_info::Node;
 use solana_ledger::blockstore_processor::process_entries;
-use solana_ledger::entry::{next_hash, Entry};
 use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
 use solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path};
 use solana_perf::packet::to_packets_chunked;
 use solana_perf::test_tx::test_tx;
+use solana_poh::poh_recorder::{create_test_recorder, WorkingBankEntry};
 use solana_runtime::bank::Bank;
+use solana_runtime::cost_model::CostModel;
 use solana_sdk::genesis_config::GenesisConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::Message;
@@ -30,11 +29,12 @@ use solana_sdk::signature::Signer;
 use solana_sdk::system_instruction;
 use solana_sdk::system_transaction;
 use solana_sdk::timing::{duration_as_us, timestamp};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
+use solana_streamer::socket::SocketAddrSpace;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use test::Bencher;
 
@@ -58,7 +58,7 @@ fn check_txs(receiver: &Arc<Receiver<WorkingBankEntry>>, ref_tx_count: usize) {
 #[bench]
 fn bench_consume_buffered(bencher: &mut Bencher) {
     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100_000);
-    let bank = Arc::new(Bank::new(&genesis_config));
+    let bank = Arc::new(Bank::new_for_benches(&genesis_config));
     let ledger_path = get_tmp_ledger_path!();
     let my_pubkey = pubkey::new_rand();
     {
@@ -93,8 +93,7 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
                 None::<Box<dyn Fn()>>,
                 &BankingStageStats::default(),
                 &recorder,
-                &Arc::new(CostModel::default()),
-                &Arc::new(Mutex::new(CostTracker::new(std::u32::MAX, std::u32::MAX))),
+                &Arc::new(RwLock::new(CostModel::default())),
             );
         });
 
@@ -111,7 +110,7 @@ fn make_accounts_txs(txes: usize, mint_keypair: &Keypair, hash: Hash) -> Vec<Tra
         .into_par_iter()
         .map(|_| {
             let mut new = dummy.clone();
-            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
+            let sig: Vec<_> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
             new.message.account_keys[0] = pubkey::new_rand();
             new.message.account_keys[1] = pubkey::new_rand();
             new.signatures = vec![Signature::new(&sig[0..64])];
@@ -161,11 +160,17 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     genesis_config.ticks_per_slot = 10_000;
 
     let (verified_sender, verified_receiver) = unbounded();
+    let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
-    let mut bank = Bank::new(&genesis_config);
+    let mut bank = Bank::new_for_benches(&genesis_config);
     // Allow arbitrary transaction processing time for the purposes of this bench
     bank.ns_per_slot = std::u128::MAX;
-    let bank = Arc::new(Bank::new(&genesis_config));
+    let bank = Arc::new(Bank::new_for_benches(&genesis_config));
+
+    // set cost tracker limits to MAX so it will not filter out TXs
+    bank.write_cost_tracker()
+        .unwrap()
+        .set_limits(std::u64::MAX, std::u64::MAX);
 
     debug!("threads: {} txs: {}", num_threads, txes);
 
@@ -187,12 +192,12 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     });
     //sanity check, make sure all the transactions can execute sequentially
     transactions.iter().for_each(|tx| {
-        let res = bank.process_transaction(&tx);
+        let res = bank.process_transaction(tx);
         assert!(res.is_ok(), "sanity test transactions");
     });
     bank.clear_signatures();
     //sanity check, make sure all the transactions can execute in parallel
-    let res = bank.process_transactions(&transactions);
+    let res = bank.process_transactions(transactions.iter());
     for r in res {
         assert!(r.is_ok(), "sanity parallel execution");
     }
@@ -205,18 +210,22 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         );
         let (exit, poh_recorder, poh_service, signal_receiver) =
             create_test_recorder(&bank, &blockstore, None);
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let cluster_info = ClusterInfo::new(
+            Node::new_localhost().info,
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        );
         let cluster_info = Arc::new(cluster_info);
         let (s, _r) = unbounded();
-        let _banking_stage = BankingStage::new_with_cost_limit(
+        let _banking_stage = BankingStage::new(
             &cluster_info,
             &poh_recorder,
             verified_receiver,
+            tpu_vote_receiver,
             vote_receiver,
             None,
             s,
-            std::u32::MAX,
-            std::u32::MAX,
+            Arc::new(RwLock::new(CostModel::default())),
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 
@@ -260,6 +269,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             start += chunk_len;
             start %= verified.len();
         });
+        drop(tpu_vote_sender);
         drop(vote_sender);
         exit.store(true, Ordering::Relaxed);
         poh_service.join().unwrap();
@@ -280,13 +290,13 @@ fn bench_banking_stage_multi_programs(bencher: &mut Bencher) {
 fn simulate_process_entries(
     randomize_txs: bool,
     mint_keypair: &Keypair,
-    mut tx_vector: Vec<Transaction>,
+    mut tx_vector: Vec<VersionedTransaction>,
     genesis_config: &GenesisConfig,
     keypairs: &[Keypair],
     initial_lamports: u64,
     num_accounts: usize,
 ) {
-    let bank = Arc::new(Bank::new(genesis_config));
+    let bank = Arc::new(Bank::new_for_benches(genesis_config));
 
     for i in 0..(num_accounts / 2) {
         bank.transfer(initial_lamports, mint_keypair, &keypairs[i * 2].pubkey())
@@ -294,12 +304,15 @@ fn simulate_process_entries(
     }
 
     for i in (0..num_accounts).step_by(2) {
-        tx_vector.push(system_transaction::transfer(
-            &keypairs[i],
-            &keypairs[i + 1].pubkey(),
-            initial_lamports,
-            bank.last_blockhash(),
-        ));
+        tx_vector.push(
+            system_transaction::transfer(
+                &keypairs[i],
+                &keypairs[i + 1].pubkey(),
+                initial_lamports,
+                bank.last_blockhash(),
+            )
+            .into(),
+        );
     }
 
     // Transfer lamports to each other
@@ -308,7 +321,7 @@ fn simulate_process_entries(
         hash: next_hash(&bank.last_blockhash(), 1, &tx_vector),
         transactions: tx_vector,
     };
-    process_entries(&bank, &mut [entry], randomize_txs, None, None).unwrap();
+    process_entries(&bank, vec![entry], randomize_txs, None, None).unwrap();
 }
 
 #[allow(clippy::same_item_push)]
@@ -328,7 +341,7 @@ fn bench_process_entries(randomize_txs: bool, bencher: &mut Bencher) {
     } = create_genesis_config((num_accounts + 1) as u64 * initial_lamports);
 
     let mut keypairs: Vec<Keypair> = vec![];
-    let tx_vector: Vec<Transaction> = Vec::with_capacity(num_accounts / 2);
+    let tx_vector: Vec<VersionedTransaction> = Vec::with_capacity(num_accounts / 2);
 
     for _ in 0..num_accounts {
         let keypair = Keypair::new();

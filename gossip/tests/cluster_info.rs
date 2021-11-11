@@ -5,8 +5,10 @@ use {
     solana_gossip::{
         cluster_info::{compute_retransmit_peers, ClusterInfo},
         contact_info::ContactInfo,
+        deprecated::{shuffle_peers_and_index, sorted_retransmit_peers_and_stakes},
     },
-    solana_sdk::pubkey::Pubkey,
+    solana_sdk::{pubkey::Pubkey, signer::keypair::Keypair},
+    solana_streamer::socket::SocketAddrSpace,
     std::{
         collections::{HashMap, HashSet},
         sync::{
@@ -78,7 +80,11 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
 
     // describe the leader
     let leader_info = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
-    let cluster_info = ClusterInfo::new_with_invalid_keypair(leader_info.clone());
+    let cluster_info = ClusterInfo::new(
+        leader_info.clone(),
+        Arc::new(Keypair::new()),
+        SocketAddrSpace::Unspecified,
+    );
 
     // setup staked nodes
     let mut staked_nodes = HashMap::new();
@@ -118,14 +124,13 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
         .map(|i| {
             let mut seed = [0; 32];
             seed[0..4].copy_from_slice(&i.to_le_bytes());
+            // TODO: Ideally these should use the new methods in
+            // solana_core::cluster_nodes, however that would add build
+            // dependency on solana_core which is not desired.
             let (peers, stakes_and_index) =
-                cluster_info.sorted_retransmit_peers_and_stakes(Some(&staked_nodes));
-            let (_, shuffled_stakes_and_indexes) = ClusterInfo::shuffle_peers_and_index(
-                &cluster_info.id(),
-                &peers,
-                &stakes_and_index,
-                seed,
-            );
+                sorted_retransmit_peers_and_stakes(&cluster_info, Some(&staked_nodes));
+            let (_, shuffled_stakes_and_indexes) =
+                shuffle_peers_and_index(&cluster_info.id(), &peers, &stakes_and_index, seed);
             shuffled_stakes_and_indexes
                 .into_iter()
                 .map(|(_, i)| peers[i].clone())

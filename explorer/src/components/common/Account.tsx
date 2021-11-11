@@ -1,7 +1,7 @@
 import React from "react";
 import { Address } from "./Address";
 import { Account } from "providers/accounts";
-import { lamportsToSolString } from "utils";
+import { SolBalance } from "utils";
 
 type AccountHeaderProps = {
   title: string;
@@ -41,23 +41,8 @@ export function AccountBalanceRow({ account }: AccountProps) {
     <tr>
       <td>Balance (SOL)</td>
       <td className="text-lg-right text-uppercase">
-        {lamportsToSolString(lamports)}
+        <SolBalance lamports={lamports} />
       </td>
     </tr>
   );
-}
-
-export function AccountOwnerRow({ account }: AccountProps) {
-  if (account.details) {
-    return (
-      <tr>
-        <td>Owner</td>
-        <td className="text-lg-right">
-          <Address pubkey={account.details.owner} alignRight link />
-        </td>
-      </tr>
-    );
-  }
-
-  return <></>;
 }

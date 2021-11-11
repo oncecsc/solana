@@ -217,6 +217,8 @@ pub fn next_keyed_account<'a, 'b, I: Iterator<Item = &'a KeyedAccount<'b>>>(
 }
 
 /// Return the KeyedAccount at the specified index or a NotEnoughAccountKeys error
+///
+/// Index zero starts at the chain of program accounts, followed by the instruction accounts.
 pub fn keyed_account_at_index<'a>(
     keyed_accounts: &'a [KeyedAccount],
     index: usize,
@@ -270,6 +272,9 @@ mod tests {
     }
     crate::declare_id!("TestSysvar111111111111111111111111111111111");
     impl solana_program::sysvar::SysvarId for TestSysvar {
+        fn id() -> crate::pubkey::Pubkey {
+            id()
+        }
         fn check_id(pubkey: &crate::pubkey::Pubkey) -> bool {
             check_id(pubkey)
         }

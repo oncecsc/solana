@@ -1,6 +1,6 @@
 use crate::erasure::ErasureConfig;
 use serde::{Deserialize, Serialize};
-use solana_sdk::clock::Slot;
+use solana_sdk::{clock::Slot, hash::Hash};
 use std::{collections::BTreeSet, ops::RangeBounds};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -28,8 +28,8 @@ pub struct SlotMeta {
     // True if this slot is full (consumed == last_index + 1) and if every
     // slot that is a parent of this slot is also connected.
     pub is_connected: bool,
-    // List of start indexes for completed data slots
-    pub completed_data_indexes: Vec<u32>,
+    // Shreds indices which are marked data complete.
+    pub completed_data_indexes: BTreeSet<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -73,6 +73,33 @@ pub enum ErasureMetaStatus {
     CanRecover,
     DataFull,
     StillNeed(usize),
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+pub enum FrozenHashVersioned {
+    Current(FrozenHashStatus),
+}
+
+impl FrozenHashVersioned {
+    pub fn frozen_hash(&self) -> Hash {
+        match self {
+            FrozenHashVersioned::Current(frozen_hash_status) => frozen_hash_status.frozen_hash,
+        }
+    }
+
+    pub fn is_duplicate_confirmed(&self) -> bool {
+        match self {
+            FrozenHashVersioned::Current(frozen_hash_status) => {
+                frozen_hash_status.is_duplicate_confirmed
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+pub struct FrozenHashStatus {
+    pub frozen_hash: Hash,
+    pub is_duplicate_confirmed: bool,
 }
 
 impl Index {
@@ -172,14 +199,10 @@ impl SlotMeta {
     pub(crate) fn new(slot: Slot, parent_slot: Slot) -> Self {
         SlotMeta {
             slot,
-            consumed: 0,
-            received: 0,
-            first_shred_timestamp: 0,
             parent_slot,
-            next_slots: vec![],
             is_connected: slot == 0,
             last_index: std::u64::MAX,
-            completed_data_indexes: vec![],
+            ..SlotMeta::default()
         }
     }
 
@@ -251,6 +274,11 @@ pub struct PerfSample {
     pub num_transactions: u64,
     pub num_slots: u64,
     pub sample_period_secs: u16,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ProgramCost {
+    pub cost: u64,
 }
 
 #[cfg(test)]

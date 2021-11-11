@@ -1,4 +1,4 @@
-//! @brief An Upgradeable Solana BPF loader.
+//! An Upgradeable Solana BPF loader.
 //!
 //! The upgradeable BPF loader is responsible for deploying, upgrading, and
 //! executing BPF programs.  The upgradeable loader allows a program's authority
@@ -189,11 +189,15 @@ pub fn upgrade(
 }
 
 pub fn is_upgrade_instruction(instruction_data: &[u8]) -> bool {
-    3 == instruction_data[0]
+    !instruction_data.is_empty() && 3 == instruction_data[0]
 }
 
 pub fn is_set_authority_instruction(instruction_data: &[u8]) -> bool {
-    4 == instruction_data[0]
+    !instruction_data.is_empty() && 4 == instruction_data[0]
+}
+
+pub fn is_close_instruction(instruction_data: &[u8]) -> bool {
+    !instruction_data.is_empty() && 5 == instruction_data[0]
 }
 
 /// Returns the instructions required to set a buffers's authority.
@@ -231,17 +235,37 @@ pub fn set_upgrade_authority(
     Instruction::new_with_bincode(id(), &UpgradeableLoaderInstruction::SetAuthority, metas)
 }
 
-/// Returns the instructions required to close an account
+/// Returns the instructions required to close a buffer account
 pub fn close(
     close_address: &Pubkey,
     recipient_address: &Pubkey,
     authority_address: &Pubkey,
 ) -> Instruction {
-    let metas = vec![
+    close_any(
+        close_address,
+        recipient_address,
+        Some(authority_address),
+        None,
+    )
+}
+
+/// Returns the instructions required to close program, buffer, or uninitialized account
+pub fn close_any(
+    close_address: &Pubkey,
+    recipient_address: &Pubkey,
+    authority_address: Option<&Pubkey>,
+    program_address: Option<&Pubkey>,
+) -> Instruction {
+    let mut metas = vec![
         AccountMeta::new(*close_address, false),
         AccountMeta::new(*recipient_address, false),
-        AccountMeta::new_readonly(*authority_address, true),
     ];
+    if let Some(authority_address) = authority_address {
+        metas.push(AccountMeta::new(*authority_address, true));
+    }
+    if let Some(program_address) = program_address {
+        metas.push(AccountMeta::new(*program_address, false));
+    }
     Instruction::new_with_bincode(id(), &UpgradeableLoaderInstruction::Close, metas)
 }
 
@@ -331,6 +355,7 @@ mod tests {
 
     #[test]
     fn test_is_set_authority_instruction() {
+        assert!(!is_set_authority_instruction(&[]));
         assert_is_instruction(
             is_set_authority_instruction,
             UpgradeableLoaderInstruction::SetAuthority {},
@@ -339,6 +364,7 @@ mod tests {
 
     #[test]
     fn test_is_upgrade_instruction() {
+        assert!(!is_upgrade_instruction(&[]));
         assert_is_instruction(
             is_upgrade_instruction,
             UpgradeableLoaderInstruction::Upgrade {},

@@ -4,35 +4,54 @@ use crate::{
         self, BlockstoreProcessorError, BlockstoreProcessorResult, CacheBlockMetaSender,
         ProcessOptions, TransactionStatusSender,
     },
-    entry::VerifyRecyclers,
     leader_schedule_cache::LeaderScheduleCache,
 };
+
 use log::*;
+use solana_entry::entry::VerifyRecyclers;
 use solana_runtime::{
-    bank_forks::{ArchiveFormat, BankForks, SnapshotConfig},
+    accounts_update_notifier_interface::AccountsUpdateNotifier,
+    bank_forks::BankForks,
+    snapshot_archive_info::SnapshotArchiveInfoGetter,
+    snapshot_config::SnapshotConfig,
+    snapshot_hash::{FullSnapshotHash, IncrementalSnapshotHash, StartingSnapshotHashes},
+    snapshot_package::AccountsPackageSender,
     snapshot_utils,
 };
-use solana_sdk::{clock::Slot, genesis_config::GenesisConfig, hash::Hash};
+use solana_sdk::{clock::Slot, genesis_config::GenesisConfig};
 use std::{fs, path::PathBuf, process, result};
 
 pub type LoadResult = result::Result<
-    (BankForks, LeaderScheduleCache, Option<(Slot, Hash)>),
+    (
+        BankForks,
+        LeaderScheduleCache,
+        Option<Slot>,
+        Option<StartingSnapshotHashes>,
+    ),
     BlockstoreProcessorError,
 >;
 
 fn to_loadresult(
     bpr: BlockstoreProcessorResult,
-    snapshot_slot_and_hash: Option<(Slot, Hash)>,
+    starting_snapshot_hashes: Option<StartingSnapshotHashes>,
 ) -> LoadResult {
-    bpr.map(|(bank_forks, leader_schedule_cache)| {
-        (bank_forks, leader_schedule_cache, snapshot_slot_and_hash)
-    })
+    bpr.map(
+        |(bank_forks, leader_schedule_cache, last_full_snapshot_slot)| {
+            (
+                bank_forks,
+                leader_schedule_cache,
+                last_full_snapshot_slot,
+                starting_snapshot_hashes,
+            )
+        },
+    )
 }
 
 /// Load the banks and accounts
 ///
 /// If a snapshot config is given, and a snapshot is found, it will be loaded.  Otherwise, load
 /// from genesis.
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     genesis_config: &GenesisConfig,
     blockstore: &Blockstore,
@@ -42,34 +61,34 @@ pub fn load(
     process_options: ProcessOptions,
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
+    accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> LoadResult {
-    if let Some(snapshot_config) = snapshot_config.as_ref() {
+    if let Some(snapshot_config) = snapshot_config {
         info!(
-            "Initializing snapshot path: {:?}",
-            snapshot_config.snapshot_path
+            "Initializing bank snapshot path: {}",
+            snapshot_config.bank_snapshots_dir.display()
         );
-        let _ = fs::remove_dir_all(&snapshot_config.snapshot_path);
-        fs::create_dir_all(&snapshot_config.snapshot_path)
+        let _ = fs::remove_dir_all(&snapshot_config.bank_snapshots_dir);
+        fs::create_dir_all(&snapshot_config.bank_snapshots_dir)
             .expect("Couldn't create snapshot directory");
 
-        if let Some((archive_filename, (archive_slot, archive_hash, archive_format))) =
-            snapshot_utils::get_highest_snapshot_archive_path(
-                &snapshot_config.snapshot_package_output_path,
-            )
+        if snapshot_utils::get_highest_full_snapshot_archive_info(
+            &snapshot_config.snapshot_archives_dir,
+        )
+        .is_some()
         {
             return load_from_snapshot(
-                &genesis_config,
-                &blockstore,
+                genesis_config,
+                blockstore,
                 account_paths,
                 shrink_paths,
                 snapshot_config,
                 process_options,
                 transaction_status_sender,
                 cache_block_meta_sender,
-                archive_filename,
-                archive_slot,
-                archive_hash,
-                archive_format,
+                accounts_package_sender,
+                accounts_update_notifier,
             );
         } else {
             info!("No snapshot package available; will load from genesis");
@@ -78,12 +97,25 @@ pub fn load(
         info!("Snapshots disabled; will load from genesis");
     }
 
+    if process_options
+        .accounts_db_config
+        .as_ref()
+        .and_then(|config| config.filler_account_count)
+        .unwrap_or_default()
+        > 0
+    {
+        panic!("filler accounts specified, but not loading from snapshot");
+    }
+
     load_from_genesis(
-        &genesis_config,
-        &blockstore,
+        genesis_config,
+        blockstore,
         account_paths,
         process_options,
         cache_block_meta_sender,
+        snapshot_config,
+        accounts_package_sender,
+        accounts_update_notifier,
     )
 }
 
@@ -93,15 +125,21 @@ fn load_from_genesis(
     account_paths: Vec<PathBuf>,
     process_options: ProcessOptions,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
+    snapshot_config: Option<&SnapshotConfig>,
+    accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> LoadResult {
     info!("Processing ledger from genesis");
     to_loadresult(
         blockstore_processor::process_blockstore(
-            &genesis_config,
-            &blockstore,
+            genesis_config,
+            blockstore,
             account_paths,
             process_options,
             cache_block_meta_sender,
+            snapshot_config,
+            accounts_package_sender,
+            accounts_update_notifier,
         ),
         None,
     )
@@ -117,53 +155,60 @@ fn load_from_snapshot(
     process_options: ProcessOptions,
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
-    archive_filename: PathBuf,
-    archive_slot: Slot,
-    archive_hash: Hash,
-    archive_format: ArchiveFormat,
+    accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> LoadResult {
-    info!("Loading snapshot package: {:?}", archive_filename);
-
     // Fail hard here if snapshot fails to load, don't silently continue
     if account_paths.is_empty() {
         error!("Account paths not present when booting from snapshot");
         process::exit(1);
     }
 
-    let deserialized_bank = snapshot_utils::bank_from_archive(
-        &account_paths,
-        &process_options.frozen_accounts,
-        &snapshot_config.snapshot_path,
-        &archive_filename,
-        archive_format,
-        genesis_config,
-        process_options.debug_keys.clone(),
-        Some(&crate::builtins::get(process_options.bpf_jit)),
-        process_options.account_indexes.clone(),
-        process_options.accounts_db_caching_enabled,
-        process_options.limit_load_slot_count_from_snapshot,
-    )
-    .expect("Load from snapshot failed");
+    let (deserialized_bank, timings, full_snapshot_archive_info, incremental_snapshot_archive_info) =
+        snapshot_utils::bank_from_latest_snapshot_archives(
+            &snapshot_config.bank_snapshots_dir,
+            &snapshot_config.snapshot_archives_dir,
+            &account_paths,
+            &process_options.frozen_accounts,
+            genesis_config,
+            process_options.debug_keys.clone(),
+            Some(&crate::builtins::get(process_options.bpf_jit)),
+            process_options.account_indexes.clone(),
+            process_options.accounts_db_caching_enabled,
+            process_options.limit_load_slot_count_from_snapshot,
+            process_options.shrink_ratio,
+            process_options.accounts_db_test_hash_calculation,
+            process_options.accounts_db_skip_shrink,
+            process_options.verify_index,
+            process_options.accounts_db_config.clone(),
+            accounts_update_notifier,
+        )
+        .expect("Load from snapshot failed");
+
     if let Some(shrink_paths) = shrink_paths {
         deserialized_bank.set_shrink_paths(shrink_paths);
     }
 
-    if process_options.accounts_db_test_hash_calculation {
-        deserialized_bank.update_accounts_hash_with_index_option(false, true);
-    }
-
-    let deserialized_bank_slot_and_hash = (
-        deserialized_bank.slot(),
-        deserialized_bank.get_accounts_hash(),
-    );
-
-    if deserialized_bank_slot_and_hash != (archive_slot, archive_hash) {
-        error!(
-            "Snapshot has mismatch:\narchive: {:?}\ndeserialized: {:?}",
-            archive_hash, deserialized_bank_slot_and_hash
-        );
-        process::exit(1);
-    }
+    let starting_full_snapshot_hash = FullSnapshotHash {
+        hash: (
+            full_snapshot_archive_info.slot(),
+            *full_snapshot_archive_info.hash(),
+        ),
+    };
+    let starting_incremental_snapshot_hash =
+        incremental_snapshot_archive_info.map(|incremental_snapshot_archive_info| {
+            IncrementalSnapshotHash {
+                base: starting_full_snapshot_hash.hash,
+                hash: (
+                    incremental_snapshot_archive_info.slot(),
+                    *incremental_snapshot_archive_info.hash(),
+                ),
+            }
+        });
+    let starting_snapshot_hashes = StartingSnapshotHashes {
+        full: starting_full_snapshot_hash,
+        incremental: starting_incremental_snapshot_hash,
+    };
 
     to_loadresult(
         blockstore_processor::process_blockstore_from_root(
@@ -173,7 +218,11 @@ fn load_from_snapshot(
             &VerifyRecyclers::default(),
             transaction_status_sender,
             cache_block_meta_sender,
+            Some(snapshot_config),
+            accounts_package_sender,
+            timings,
+            full_snapshot_archive_info.slot(),
         ),
-        Some(deserialized_bank_slot_and_hash),
+        Some(starting_snapshot_hashes),
     )
 }

@@ -48,6 +48,10 @@ impl SlotCacheInner {
         );
     }
 
+    pub fn get_all_pubkeys(&self) -> Vec<Pubkey> {
+        self.cache.iter().map(|item| *item.key()).collect()
+    }
+
     pub fn insert(
         &self,
         pubkey: &Pubkey,
@@ -129,6 +133,9 @@ impl CachedAccountInner {
                 hash
             }
         }
+    }
+    pub fn pubkey(&self) -> &Pubkey {
+        &self.pubkey
     }
 }
 

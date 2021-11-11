@@ -1,6 +1,5 @@
 use crate::{
     optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
-    poh_recorder::PohRecorder,
     replay_stage::DUPLICATE_THRESHOLD,
     result::{Error, Result},
     sigverify,
@@ -20,6 +19,7 @@ use solana_gossip::{
 use solana_ledger::blockstore::Blockstore;
 use solana_metrics::inc_new_counter_debug;
 use solana_perf::packet::{self, Packets};
+use solana_poh::poh_recorder::PohRecorder;
 use solana_rpc::{
     optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSender},
     rpc_subscriptions::RpcSubscriptions,
@@ -29,11 +29,10 @@ use solana_runtime::{
     bank_forks::BankForks,
     commitment::VOTE_THRESHOLD_SIZE,
     epoch_stakes::{EpochAuthorizedVoters, EpochStakes},
-    stakes::Stakes,
     vote_sender_types::{ReplayVoteReceiver, ReplayedVote},
 };
 use solana_sdk::{
-    clock::{Epoch, Slot, DEFAULT_MS_PER_SLOT},
+    clock::{Epoch, Slot, DEFAULT_MS_PER_SLOT, DEFAULT_TICKS_PER_SLOT},
     epoch_schedule::EpochSchedule,
     hash::Hash,
     pubkey::Pubkey,
@@ -110,7 +109,7 @@ impl VoteTracker {
             epoch_schedule: *root_bank.epoch_schedule(),
             ..VoteTracker::default()
         };
-        vote_tracker.progress_with_new_root_bank(&root_bank);
+        vote_tracker.progress_with_new_root_bank(root_bank);
         assert_eq!(
             *vote_tracker.leader_schedule_epoch.read().unwrap(),
             root_bank.get_leader_schedule_epoch(root_bank.slot())
@@ -351,7 +350,10 @@ impl ClusterInfoVoteListener {
         labels: Vec<CrdsValueLabel>,
     ) -> (Vec<Transaction>, Vec<(CrdsValueLabel, Slot, Packets)>) {
         let mut msgs = packet::to_packets_chunked(&votes, 1);
-        sigverify::ed25519_verify_cpu(&mut msgs);
+
+        // Votes should already be filtered by this point.
+        let reject_non_vote = false;
+        sigverify::ed25519_verify_cpu(&mut msgs, reject_non_vote);
 
         let (vote_txs, packets) = izip!(labels.into_iter(), votes.into_iter(), msgs,)
             .filter_map(|(label, vote, packet)| {
@@ -384,15 +386,20 @@ impl ClusterInfoVoteListener {
                 return Ok(());
             }
 
+            let would_be_leader = poh_recorder
+                .lock()
+                .unwrap()
+                .would_be_leader(20 * DEFAULT_TICKS_PER_SLOT);
             if let Err(e) = verified_vote_packets.receive_and_process_vote_packets(
                 &verified_vote_label_packets_receiver,
                 &mut update_version,
+                would_be_leader,
             ) {
                 match e {
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Disconnected) => {
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Disconnected) => {
                         return Ok(());
                     }
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Timeout) => (),
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Timeout) => (),
                     _ => {
                         error!("thread {:?} error {:?}", thread::current().name(), e);
                     }
@@ -474,8 +481,8 @@ impl ClusterInfoVoteListener {
                         .add_new_optimistic_confirmed_slots(confirmed_slots.clone());
                 }
                 Err(e) => match e {
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Timeout)
-                    | Error::ReadyTimeoutError => (),
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Timeout)
+                    | Error::ReadyTimeout => (),
                     _ => {
                         error!("thread {:?} error {:?}", thread::current().name(), e);
                     }
@@ -596,9 +603,9 @@ impl ClusterInfoVoteListener {
             // The last vote slot, which is the greatest slot in the stack
             // of votes in a vote transaction, qualifies for optimistic confirmation.
             if slot == last_vote_slot {
-                let vote_accounts = Stakes::vote_accounts(epoch_stakes.stakes());
+                let vote_accounts = epoch_stakes.stakes().vote_accounts();
                 let stake = vote_accounts
-                    .get(&vote_pubkey)
+                    .get(vote_pubkey)
                     .map(|(stake, _)| *stake)
                     .unwrap_or_default();
                 let total_stake = epoch_stakes.total_stake();
@@ -687,7 +694,7 @@ impl ClusterInfoVoteListener {
         // voters trying to make votes for slots earlier than the epoch for
         // which they are authorized
         let actual_authorized_voter =
-            vote_tracker.get_authorized_voter(&vote_pubkey, *last_vote_slot);
+            vote_tracker.get_authorized_voter(vote_pubkey, *last_vote_slot);
 
         if actual_authorized_voter.is_none() {
             return false;
@@ -695,7 +702,7 @@ impl ClusterInfoVoteListener {
 
         // Voting without the correct authorized pubkey, dump the vote
         if !VoteTracker::vote_contains_authorized_voter(
-            &gossip_tx,
+            gossip_tx,
             &actual_authorized_voter.unwrap(),
         ) {
             return false;
@@ -733,7 +740,7 @@ impl ClusterInfoVoteListener {
             Self::track_new_votes_and_notify_confirmations(
                 vote,
                 &vote_pubkey,
-                &vote_tracker,
+                vote_tracker,
                 root_bank,
                 subscriptions,
                 verified_vote_sender,
@@ -1032,7 +1039,7 @@ mod tests {
                 vec![stake_per_validator; validator_voting_keypairs.len()],
             );
 
-        let bank0 = Bank::new(&genesis_config);
+        let bank0 = Bank::new_for_tests(&genesis_config);
         // Votes for slots less than the provided root bank's slot should not be processed
         let bank3 = Arc::new(Bank::new_from_parent(
             &Arc::new(bank0),
@@ -1146,7 +1153,7 @@ mod tests {
                 &validator_voting_keypairs,
                 vec![stake_per_validator; validator_voting_keypairs.len()],
             );
-        let bank0 = Bank::new(&genesis_config);
+        let bank0 = Bank::new_for_tests(&genesis_config);
 
         let gossip_vote_slots = vec![1, 2];
         let replay_vote_slots = vec![3, 4];
@@ -1281,7 +1288,7 @@ mod tests {
                 &validator_voting_keypairs,
                 vec![stake_per_validator; validator_voting_keypairs.len()],
             );
-        let bank0 = Bank::new(&genesis_config);
+        let bank0 = Bank::new_for_tests(&genesis_config);
 
         // Send some votes to process
         let (votes_txs_sender, votes_txs_receiver) = unbounded();
@@ -1519,14 +1526,14 @@ mod tests {
                 &validator_keypairs,
                 vec![100; validator_keypairs.len()],
             );
-        let bank = Bank::new(&genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
         let exit = Arc::new(AtomicBool::new(false));
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let bank = bank_forks.read().unwrap().get(0).unwrap().clone();
         let vote_tracker = VoteTracker::new(&bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let subscriptions = Arc::new(RpcSubscriptions::new(
+        let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
@@ -1638,14 +1645,14 @@ mod tests {
                 &validator_voting_keypairs,
                 vec![100; validator_voting_keypairs.len()],
             );
-        let bank = Bank::new(&genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
         let vote_tracker = VoteTracker::new(&bank);
         let exit = Arc::new(AtomicBool::new(false));
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let bank = bank_forks.read().unwrap().get(0).unwrap().clone();
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let subscriptions = Arc::new(RpcSubscriptions::new(
+        let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             &exit,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),

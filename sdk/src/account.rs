@@ -8,7 +8,7 @@ use std::{cell::Ref, cell::RefCell, cmp, fmt, rc::Rc, sync::Arc};
 
 /// An Account with data that is stored on chain
 #[repr(C)]
-#[frozen_abi(digest = "AXJTWWXfp49rHb34ayFzFLSEuaRbMUsVPNzBDyP3UPjc")]
+#[frozen_abi(digest = "HawRVHh7t4d3H3bitWHFt25WhhoDmbJMCfWdESQQoYEy")]
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Default, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -588,7 +588,7 @@ pub mod tests {
     use super::*;
 
     fn make_two_accounts(key: &Pubkey) -> (Account, AccountSharedData) {
-        let mut account1 = Account::new(1, 2, &key);
+        let mut account1 = Account::new(1, 2, key);
         account1.executable = true;
         account1.rent_epoch = 4;
         let mut account2 = AccountSharedData::new(1, 2, key);

@@ -1,16 +1,13 @@
 #![cfg(feature = "full")]
 
-use crate::instruction::Instruction;
+use crate::{
+    feature_set::{libsecp256k1_0_5_upgrade_enabled, libsecp256k1_fail_on_bad_count, FeatureSet},
+    instruction::Instruction,
+    precompiles::PrecompileError,
+};
 use digest::Digest;
 use serde_derive::{Deserialize, Serialize};
-
-#[derive(Debug, PartialEq)]
-pub enum Secp256k1Error {
-    InvalidSignature,
-    InvalidRecoveryId,
-    InvalidDataOffsets,
-    InvalidInstructionDataSize,
-}
+use std::sync::Arc;
 
 pub const HASHED_PUBKEY_SERIALIZED_SIZE: usize = 20;
 pub const SIGNATURE_SERIALIZED_SIZE: usize = 64;
@@ -29,18 +26,18 @@ pub struct SecpSignatureOffsets {
 }
 
 pub fn new_secp256k1_instruction(
-    priv_key: &secp256k1::SecretKey,
+    priv_key: &libsecp256k1::SecretKey,
     message_arr: &[u8],
 ) -> Instruction {
-    let secp_pubkey = secp256k1::PublicKey::from_secret_key(priv_key);
+    let secp_pubkey = libsecp256k1::PublicKey::from_secret_key(priv_key);
     let eth_pubkey = construct_eth_pubkey(&secp_pubkey);
     let mut hasher = sha3::Keccak256::new();
     hasher.update(&message_arr);
     let message_hash = hasher.finalize();
     let mut message_hash_arr = [0u8; 32];
-    message_hash_arr.copy_from_slice(&message_hash.as_slice());
-    let message = secp256k1::Message::parse(&message_hash_arr);
-    let (signature, recovery_id) = secp256k1::sign(&message, priv_key);
+    message_hash_arr.copy_from_slice(message_hash.as_slice());
+    let message = libsecp256k1::Message::parse(&message_hash_arr);
+    let (signature, recovery_id) = libsecp256k1::sign(&message, priv_key);
     let signature_arr = signature.serialize();
     assert_eq!(signature_arr.len(), SIGNATURE_SERIALIZED_SIZE);
 
@@ -90,26 +87,36 @@ pub fn new_secp256k1_instruction(
     }
 }
 
-pub fn construct_eth_pubkey(pubkey: &secp256k1::PublicKey) -> [u8; HASHED_PUBKEY_SERIALIZED_SIZE] {
+pub fn construct_eth_pubkey(
+    pubkey: &libsecp256k1::PublicKey,
+) -> [u8; HASHED_PUBKEY_SERIALIZED_SIZE] {
     let mut addr = [0u8; HASHED_PUBKEY_SERIALIZED_SIZE];
     addr.copy_from_slice(&sha3::Keccak256::digest(&pubkey.serialize()[1..])[12..]);
     assert_eq!(addr.len(), HASHED_PUBKEY_SERIALIZED_SIZE);
     addr
 }
 
-pub fn verify_eth_addresses(
+pub fn verify(
     data: &[u8],
     instruction_datas: &[&[u8]],
-) -> Result<(), Secp256k1Error> {
+    feature_set: &Arc<FeatureSet>,
+) -> Result<(), PrecompileError> {
     if data.is_empty() {
-        return Err(Secp256k1Error::InvalidInstructionDataSize);
+        return Err(PrecompileError::InvalidInstructionDataSize);
     }
     let count = data[0] as usize;
+    if feature_set.is_active(&libsecp256k1_fail_on_bad_count::id()) && count == 0 && data.len() > 1
+    {
+        // count is zero but the instruction data indicates that is probably not
+        // correct, fail the instruction to catch probable invalid secp256k1
+        // instruction construction.
+        return Err(PrecompileError::InvalidInstructionDataSize);
+    }
     let expected_data_size = count
         .saturating_mul(SIGNATURE_OFFSETS_SERIALIZED_SIZE)
         .saturating_add(1);
     if data.len() < expected_data_size {
-        return Err(Secp256k1Error::InvalidInstructionDataSize);
+        return Err(PrecompileError::InvalidInstructionDataSize);
     }
     for i in 0..count {
         let start = i
@@ -118,29 +125,38 @@ pub fn verify_eth_addresses(
         let end = start.saturating_add(SIGNATURE_OFFSETS_SERIALIZED_SIZE);
 
         let offsets: SecpSignatureOffsets = bincode::deserialize(&data[start..end])
-            .map_err(|_| Secp256k1Error::InvalidSignature)?;
+            .map_err(|_| PrecompileError::InvalidSignature)?;
 
         // Parse out signature
         let signature_index = offsets.signature_instruction_index as usize;
         if signature_index >= instruction_datas.len() {
-            return Err(Secp256k1Error::InvalidInstructionDataSize);
+            return Err(PrecompileError::InvalidInstructionDataSize);
         }
         let signature_instruction = instruction_datas[signature_index];
         let sig_start = offsets.signature_offset as usize;
         let sig_end = sig_start.saturating_add(SIGNATURE_SERIALIZED_SIZE);
         if sig_end >= signature_instruction.len() {
-            return Err(Secp256k1Error::InvalidSignature);
+            return Err(PrecompileError::InvalidSignature);
         }
-        let signature =
-            secp256k1::Signature::parse_slice(&signature_instruction[sig_start..sig_end])
-                .map_err(|_| Secp256k1Error::InvalidSignature)?;
 
-        let recovery_id = secp256k1::RecoveryId::parse(signature_instruction[sig_end])
-            .map_err(|_| Secp256k1Error::InvalidRecoveryId)?;
+        let sig_parse_result = if feature_set.is_active(&libsecp256k1_0_5_upgrade_enabled::id()) {
+            libsecp256k1::Signature::parse_standard_slice(
+                &signature_instruction[sig_start..sig_end],
+            )
+        } else {
+            libsecp256k1::Signature::parse_overflowing_slice(
+                &signature_instruction[sig_start..sig_end],
+            )
+        };
+
+        let signature = sig_parse_result.map_err(|_| PrecompileError::InvalidSignature)?;
+
+        let recovery_id = libsecp256k1::RecoveryId::parse(signature_instruction[sig_end])
+            .map_err(|_| PrecompileError::InvalidRecoveryId)?;
 
         // Parse out pubkey
         let eth_address_slice = get_data_slice(
-            &instruction_datas,
+            instruction_datas,
             offsets.eth_address_instruction_index,
             offsets.eth_address_offset,
             HASHED_PUBKEY_SERIALIZED_SIZE,
@@ -148,7 +164,7 @@ pub fn verify_eth_addresses(
 
         // Parse out message
         let message_slice = get_data_slice(
-            &instruction_datas,
+            instruction_datas,
             offsets.message_instruction_index,
             offsets.message_data_offset,
             offsets.message_data_size as usize,
@@ -158,16 +174,16 @@ pub fn verify_eth_addresses(
         hasher.update(message_slice);
         let message_hash = hasher.finalize();
 
-        let pubkey = secp256k1::recover(
-            &secp256k1::Message::parse_slice(&message_hash).unwrap(),
+        let pubkey = libsecp256k1::recover(
+            &libsecp256k1::Message::parse_slice(&message_hash).unwrap(),
             &signature,
             &recovery_id,
         )
-        .map_err(|_| Secp256k1Error::InvalidSignature)?;
+        .map_err(|_| PrecompileError::InvalidSignature)?;
         let eth_address = construct_eth_pubkey(&pubkey);
 
         if eth_address_slice != eth_address {
-            return Err(Secp256k1Error::InvalidSignature);
+            return Err(PrecompileError::InvalidSignature);
         }
     }
     Ok(())
@@ -178,16 +194,16 @@ fn get_data_slice<'a>(
     instruction_index: u8,
     offset_start: u16,
     size: usize,
-) -> Result<&'a [u8], Secp256k1Error> {
+) -> Result<&'a [u8], PrecompileError> {
     let signature_index = instruction_index as usize;
     if signature_index >= instruction_datas.len() {
-        return Err(Secp256k1Error::InvalidDataOffsets);
+        return Err(PrecompileError::InvalidDataOffsets);
     }
     let signature_instruction = &instruction_datas[signature_index];
     let start = offset_start as usize;
     let end = start.saturating_add(size);
     if end > signature_instruction.len() {
-        return Err(Secp256k1Error::InvalidSignature);
+        return Err(PrecompileError::InvalidSignature);
     }
 
     Ok(&instruction_datas[signature_index][start..end])
@@ -196,14 +212,35 @@ fn get_data_slice<'a>(
 #[cfg(test)]
 pub mod test {
     use super::*;
+    use crate::{
+        feature_set,
+        hash::Hash,
+        secp256k1_instruction::{
+            new_secp256k1_instruction, SecpSignatureOffsets, SIGNATURE_OFFSETS_SERIALIZED_SIZE,
+        },
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use rand::{thread_rng, Rng};
+    use std::sync::Arc;
 
-    fn test_case(num_signatures: u8, offsets: &SecpSignatureOffsets) -> Result<(), Secp256k1Error> {
+    fn test_case(
+        num_signatures: u8,
+        offsets: &SecpSignatureOffsets,
+    ) -> Result<(), PrecompileError> {
         let mut instruction_data = vec![0u8; DATA_START];
         instruction_data[0] = num_signatures;
         let writer = std::io::Cursor::new(&mut instruction_data[1..]);
         bincode::serialize_into(writer, &offsets).unwrap();
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set
+            .active
+            .remove(&libsecp256k1_0_5_upgrade_enabled::id());
+        feature_set
+            .inactive
+            .insert(libsecp256k1_0_5_upgrade_enabled::id());
 
-        verify_eth_addresses(&instruction_data, &[&[0u8; 100]])
+        verify(&instruction_data, &[&[0u8; 100]], &Arc::new(feature_set))
     }
 
     #[test]
@@ -216,10 +253,17 @@ pub mod test {
         let writer = std::io::Cursor::new(&mut instruction_data[1..]);
         bincode::serialize_into(writer, &offsets).unwrap();
         instruction_data.truncate(instruction_data.len() - 1);
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set
+            .active
+            .remove(&libsecp256k1_0_5_upgrade_enabled::id());
+        feature_set
+            .inactive
+            .insert(libsecp256k1_0_5_upgrade_enabled::id());
 
         assert_eq!(
-            verify_eth_addresses(&instruction_data, &[&[0u8; 100]]),
-            Err(Secp256k1Error::InvalidInstructionDataSize)
+            verify(&instruction_data, &[&[0u8; 100]], &Arc::new(feature_set)),
+            Err(PrecompileError::InvalidInstructionDataSize)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -228,7 +272,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidInstructionDataSize)
+            Err(PrecompileError::InvalidInstructionDataSize)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -237,7 +281,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidDataOffsets)
+            Err(PrecompileError::InvalidDataOffsets)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -246,7 +290,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidDataOffsets)
+            Err(PrecompileError::InvalidDataOffsets)
         );
     }
 
@@ -259,7 +303,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -269,7 +313,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -279,7 +323,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -289,7 +333,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
     }
 
@@ -301,7 +345,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -310,7 +354,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
     }
 
@@ -322,7 +366,7 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
 
         let offsets = SecpSignatureOffsets {
@@ -331,7 +375,72 @@ pub mod test {
         };
         assert_eq!(
             test_case(1, &offsets),
-            Err(Secp256k1Error::InvalidSignature)
+            Err(PrecompileError::InvalidSignature)
         );
+    }
+
+    #[test]
+    fn test_count_is_zero_but_sig_data_exists() {
+        solana_logger::setup();
+
+        let mut instruction_data = vec![0u8; DATA_START];
+        let offsets = SecpSignatureOffsets::default();
+        instruction_data[0] = 0;
+        let writer = std::io::Cursor::new(&mut instruction_data[1..]);
+        bincode::serialize_into(writer, &offsets).unwrap();
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set
+            .active
+            .remove(&libsecp256k1_0_5_upgrade_enabled::id());
+        feature_set
+            .inactive
+            .insert(libsecp256k1_0_5_upgrade_enabled::id());
+
+        assert_eq!(
+            verify(&instruction_data, &[&[0u8; 100]], &Arc::new(feature_set)),
+            Err(PrecompileError::InvalidInstructionDataSize)
+        );
+    }
+
+    #[test]
+    fn test_secp256k1() {
+        solana_logger::setup();
+        let offsets = SecpSignatureOffsets::default();
+        assert_eq!(
+            bincode::serialized_size(&offsets).unwrap() as usize,
+            SIGNATURE_OFFSETS_SERIALIZED_SIZE
+        );
+
+        let secp_privkey = libsecp256k1::SecretKey::random(&mut thread_rng());
+        let message_arr = b"hello";
+        let mut secp_instruction = new_secp256k1_instruction(&secp_privkey, message_arr);
+        let mint_keypair = Keypair::new();
+        let mut feature_set = feature_set::FeatureSet::all_enabled();
+        feature_set
+            .active
+            .remove(&feature_set::libsecp256k1_0_5_upgrade_enabled::id());
+        feature_set
+            .inactive
+            .insert(feature_set::libsecp256k1_0_5_upgrade_enabled::id());
+        let feature_set = Arc::new(feature_set);
+
+        let tx = Transaction::new_signed_with_payer(
+            &[secp_instruction.clone()],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            Hash::default(),
+        );
+
+        assert!(tx.verify_precompiles(&feature_set).is_ok());
+
+        let index = thread_rng().gen_range(0, secp_instruction.data.len());
+        secp_instruction.data[index] = secp_instruction.data[index].wrapping_add(12);
+        let tx = Transaction::new_signed_with_payer(
+            &[secp_instruction],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            Hash::default(),
+        );
+        assert!(tx.verify_precompiles(&feature_set).is_err());
     }
 }

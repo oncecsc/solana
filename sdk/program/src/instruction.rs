@@ -9,6 +9,14 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// Reasons the runtime might have rejected an instruction.
+///
+/// Instructions errors are included in the bank hashes and therefore are
+/// included as part of the transaction results when determining consensus.
+/// Because of this, members of this enum must not be removed, but new ones can
+/// be added.  Also, it is crucial that meta-information if any that comes along
+/// with an error be consistent across software versions.  For example, it is
+/// dangerous to include error strings from 3rd party crates because they could
+/// change at any time and changes to them are difficult to detect.
 #[derive(
     Serialize, Deserialize, Debug, Error, PartialEq, Eq, Clone, AbiExample, AbiEnumVisitor,
 )]
@@ -58,8 +66,8 @@ pub enum InstructionError {
     #[error("sum of account balances before and after instruction do not match")]
     UnbalancedInstruction,
 
-    /// Program modified an account's program id
-    #[error("instruction modified the program id of an account")]
+    /// Program illegally modified an account's program id
+    #[error("instruction illegally modified the program id of an account")]
     ModifiedProgramId,
 
     /// Program spent the lamports of an account that doesn't belong to it
@@ -95,8 +103,8 @@ pub enum InstructionError {
     #[error("insufficient account keys for instruction")]
     NotEnoughAccountKeys,
 
-    /// A non-system program changed the size of the account data
-    #[error("non-system instruction changed account size")]
+    /// Program other than the account's owner changed the size of the account data
+    #[error("program other than the account's owner changed the size of the account data")]
     AccountDataSizeChanged,
 
     /// The instruction expected an executable account
@@ -197,6 +205,14 @@ pub enum InstructionError {
     IncorrectAuthority,
 
     /// Failed to serialize or deserialize account data
+    ///
+    /// Warning: This error should never be emitted by the runtime.
+    ///
+    /// This error includes strings from the underlying 3rd party Borsh crate
+    /// which can be dangerous because the error strings could change across
+    /// Borsh versions. Only programs can use this error because they are
+    /// consistent across Solana software versions.
+    ///
     #[error("Failed to serialize or deserialize account data: {0}")]
     BorshIoError(String),
 
@@ -215,6 +231,12 @@ pub enum InstructionError {
     /// Unsupported sysvar
     #[error("Unsupported sysvar")]
     UnsupportedSysvar,
+
+    /// Illegal account owner
+    #[error("Provided owner is not allowed")]
+    IllegalOwner,
+    // Note: For any new error added here an equivalent ProgramError and its
+    // conversions must also be added
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]

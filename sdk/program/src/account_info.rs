@@ -1,4 +1,6 @@
-use crate::{clock::Epoch, program_error::ProgramError, pubkey::Pubkey};
+use crate::{
+    clock::Epoch, program_error::ProgramError, program_memory::sol_memset, pubkey::Pubkey,
+};
 use std::{
     cell::{Ref, RefCell, RefMut},
     cmp, fmt,
@@ -114,6 +116,53 @@ impl<'a> AccountInfo<'a> {
             .map_err(|_| ProgramError::AccountBorrowFailed)
     }
 
+    /// Realloc the account's data and optionally zero-initialize the new
+    /// memory.
+    ///
+    /// Note:  Account data can be increased within a single call by up to
+    /// `solana_program::entrypoint::MAX_PERMITTED_DATA_INCREASE` bytes.
+    ///
+    /// Note: Memory used to grow is already zero-initialized upon program
+    /// entrypoint and re-zeroing it wastes compute units.  If within the same
+    /// call a program reallocs from larger to smaller and back to larger again
+    /// the new space could contain stale data.  Pass `true` for `zero_init` in
+    /// this case, otherwise compute units will be wasted re-zero-initializing.
+    pub fn realloc(&self, new_len: usize, zero_init: bool) -> Result<(), ProgramError> {
+        let orig_len = self.data_len();
+
+        // realloc
+        unsafe {
+            // First set new length in the serialized data
+            let ptr = self.try_borrow_mut_data()?.as_mut_ptr().offset(-8) as *mut u64;
+            *ptr = new_len as u64;
+
+            // Then set the new length in the local slice
+            let ptr = &mut *(((self.data.as_ptr() as *const u64).offset(1) as u64) as *mut u64);
+            *ptr = new_len as u64;
+        }
+
+        // zero-init if requested
+        if zero_init && new_len > orig_len {
+            sol_memset(
+                &mut self.try_borrow_mut_data()?[orig_len..],
+                0,
+                new_len.saturating_sub(orig_len),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn assign(&self, new_owner: &Pubkey) {
+        // Set the non-mut owner field
+        unsafe {
+            std::ptr::write_volatile(
+                self.owner as *const Pubkey as *mut [u8; 32],
+                new_owner.to_bytes(),
+            );
+        }
+    }
+
     pub fn new(
         key: &'a Pubkey,
         is_signer: bool,
@@ -140,7 +189,7 @@ impl<'a> AccountInfo<'a> {
         bincode::deserialize(&self.data.borrow())
     }
 
-    pub fn serialize_data<T: serde::Serialize>(&mut self, state: &T) -> Result<(), bincode::Error> {
+    pub fn serialize_data<T: serde::Serialize>(&self, state: &T) -> Result<(), bincode::Error> {
         if bincode::serialized_size(state)? > self.data_len() as u64 {
             return Err(Box::new(bincode::ErrorKind::SizeLimit));
         }
@@ -198,15 +247,104 @@ impl<'a, T: Account> IntoAccountInfo<'a> for &'a mut (Pubkey, T) {
     }
 }
 
-/// Return the next `AccountInfo` or a `NotEnoughAccountKeys` error.
+/// Convenience function for accessing the next item in an [`AccountInfo`]
+/// iterator.
+///
+/// This is simply a wrapper around [`Iterator::next`] that returns a
+/// [`ProgramError`] instead of an option.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::NotEnoughAccountKeys`] if there are no more items in
+/// the iterator.
+///
+/// # Examples
+///
+/// ```
+/// use solana_program::{
+///    account_info::{AccountInfo, next_account_info},
+///    entrypoint::ProgramResult,
+///    pubkey::Pubkey,
+/// };
+/// # use solana_program::program_error::ProgramError;
+///
+/// pub fn process_instruction(
+///     program_id: &Pubkey,
+///     accounts: &[AccountInfo],
+///     instruction_data: &[u8],
+/// ) -> ProgramResult {
+///     let accounts_iter = &mut accounts.iter();
+///     let signer = next_account_info(accounts_iter)?;
+///     let payer = next_account_info(accounts_iter)?;
+///
+///     // do stuff ...
+///
+///     Ok(())
+/// }
+/// # let p = Pubkey::new_unique();
+/// # let l = &mut 0;
+/// # let d = &mut [0u8];
+/// # let a = AccountInfo::new(&p, false, false, l, d, &p, false, 0);
+/// # let accounts = &[a.clone(), a];
+/// # process_instruction(
+/// #    &Pubkey::new_unique(),
+/// #    accounts,
+/// #    &[],
+/// # )?;
+/// # Ok::<(), ProgramError>(())
+/// ```
 pub fn next_account_info<'a, 'b, I: Iterator<Item = &'a AccountInfo<'b>>>(
     iter: &mut I,
 ) -> Result<I::Item, ProgramError> {
     iter.next().ok_or(ProgramError::NotEnoughAccountKeys)
 }
 
-/// Return a slice of the next `count` `AccountInfo`s or a
-/// `NotEnoughAccountKeys` error.
+/// Convenience function for accessing multiple next items in an [`AccountInfo`]
+/// iterator.
+///
+/// Returns a slice containing the next `count` [`AccountInfo`]s.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::NotEnoughAccountKeys`] if there are not enough items
+/// in the iterator to satisfy the request.
+///
+/// # Examples
+///
+/// ```
+/// use solana_program::{
+///    account_info::{AccountInfo, next_account_info, next_account_infos},
+///    entrypoint::ProgramResult,
+///    pubkey::Pubkey,
+/// };
+/// # use solana_program::program_error::ProgramError;
+///
+/// pub fn process_instruction(
+///     program_id: &Pubkey,
+///     accounts: &[AccountInfo],
+///     instruction_data: &[u8],
+/// ) -> ProgramResult {
+///     let accounts_iter = &mut accounts.iter();
+///     let signer = next_account_info(accounts_iter)?;
+///     let payer = next_account_info(accounts_iter)?;
+///     let outputs = next_account_infos(accounts_iter, 3)?;
+///
+///     // do stuff ...
+///
+///     Ok(())
+/// }
+/// # let p = Pubkey::new_unique();
+/// # let l = &mut 0;
+/// # let d = &mut [0u8];
+/// # let a = AccountInfo::new(&p, false, false, l, d, &p, false, 0);
+/// # let accounts = &[a.clone(), a.clone(), a.clone(), a.clone(), a];
+/// # process_instruction(
+/// #    &Pubkey::new_unique(),
+/// #    accounts,
+/// #    &[],
+/// # )?;
+/// # Ok::<(), ProgramError>(())
+/// ```
 pub fn next_account_infos<'a, 'b: 'a>(
     iter: &mut std::slice::Iter<'a, AccountInfo<'b>>,
     count: usize,
@@ -218,6 +356,12 @@ pub fn next_account_infos<'a, 'b: 'a>(
     let (accounts, remaining) = accounts.split_at(count);
     *iter = remaining.iter();
     Ok(accounts)
+}
+
+impl<'a> AsRef<AccountInfo<'a>> for AccountInfo<'a> {
+    fn as_ref(&self) -> &AccountInfo<'a> {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +403,14 @@ mod tests {
         assert_eq!(k3, *info2_3_4[1].key);
         assert_eq!(k4, *info2_3_4[2].key);
         assert_eq!(k5, *info5.key);
+    }
+
+    #[test]
+    fn test_account_info_as_ref() {
+        let k = Pubkey::new_unique();
+        let l = &mut 0;
+        let d = &mut [0u8];
+        let info = AccountInfo::new(&k, false, false, l, d, &k, false, 0);
+        assert_eq!(info.key, info.as_ref().key);
     }
 }

@@ -1,11 +1,12 @@
-//! @brief Syscall stubs when building for programs for non-BPF targets
+//! Syscall stubs when building for programs for non-BPF targets
 
 #![cfg(not(target_arch = "bpf"))]
 
 use crate::{
     account_info::AccountInfo, entrypoint::ProgramResult, instruction::Instruction,
-    program_error::UNSUPPORTED_SYSVAR,
+    program_error::UNSUPPORTED_SYSVAR, pubkey::Pubkey,
 };
+use itertools::Itertools;
 use std::sync::{Arc, RwLock};
 
 lazy_static::lazy_static! {
@@ -50,9 +51,10 @@ pub trait SyscallStubs: Sync + Send {
     /// # Safety
     unsafe fn sol_memcpy(&self, dst: *mut u8, src: *const u8, n: usize) {
         // cannot be overlapping
-        if dst as usize + n > src as usize && src as usize > dst as usize {
-            panic!("memcpy does not support oveerlapping regions");
-        }
+        assert!(
+            !(dst as usize + n > src as usize && src as usize > dst as usize),
+            "memcpy does not support overlapping regions"
+        );
         std::ptr::copy_nonoverlapping(src, dst, n as usize);
     }
     /// # Safety
@@ -79,6 +81,13 @@ pub trait SyscallStubs: Sync + Send {
         for val in s.iter_mut().take(n) {
             *val = c;
         }
+    }
+    fn sol_get_return_data(&self) -> Option<(Pubkey, Vec<u8>)> {
+        None
+    }
+    fn sol_set_return_data(&mut self, _data: &[u8]) {}
+    fn sol_log_data(&self, fields: &[&[u8]]) {
+        println!("data: {}", fields.iter().map(base64::encode).join(" "));
     }
 }
 
@@ -122,8 +131,8 @@ pub(crate) fn sol_get_epoch_schedule_sysvar(var_addr: *mut u8) -> u64 {
         .sol_get_epoch_schedule_sysvar(var_addr)
 }
 
-pub(crate) fn sol_get_fees_sysvar(var_addr: *mut u8) -> u64 {
-    SYSCALL_STUBS.read().unwrap().sol_get_fees_sysvar(var_addr)
+pub(crate) fn sol_get_fees_sysvar(_var_addr: *mut u8) -> u64 {
+    UNSUPPORTED_SYSVAR
 }
 
 pub(crate) fn sol_get_rent_sysvar(var_addr: *mut u8) -> u64 {
@@ -152,4 +161,16 @@ pub(crate) fn sol_memset(s: *mut u8, c: u8, n: usize) {
     unsafe {
         SYSCALL_STUBS.read().unwrap().sol_memset(s, c, n);
     }
+}
+
+pub(crate) fn sol_get_return_data() -> Option<(Pubkey, Vec<u8>)> {
+    SYSCALL_STUBS.read().unwrap().sol_get_return_data()
+}
+
+pub(crate) fn sol_set_return_data(data: &[u8]) {
+    SYSCALL_STUBS.write().unwrap().sol_set_return_data(data)
+}
+
+pub(crate) fn sol_log_data(data: &[&[u8]]) {
+    SYSCALL_STUBS.read().unwrap().sol_log_data(data)
 }

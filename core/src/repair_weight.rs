@@ -1,6 +1,6 @@
 use crate::{
     heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice, repair_service::RepairTiming,
-    repair_weighted_traversal, serve_repair::RepairType, tree_diff::TreeDiff,
+    repair_weighted_traversal, serve_repair::ShredRepairType, tree_diff::TreeDiff,
 };
 use solana_ledger::{ancestor_iterator::AncestorIterator, blockstore::Blockstore};
 use solana_measure::measure::Measure;
@@ -147,7 +147,7 @@ impl RepairWeight {
         max_new_shreds: usize,
         ignore_slots: &impl Contains<'a, Slot>,
         repair_timing: Option<&mut RepairTiming>,
-    ) -> Vec<RepairType> {
+    ) -> Vec<ShredRepairType> {
         let mut repairs = vec![];
         let mut get_best_orphans_elapsed = Measure::start("get_best_orphans");
         // Update the orphans in order from heaviest to least heavy
@@ -160,7 +160,7 @@ impl RepairWeight {
         );
         get_best_orphans_elapsed.stop();
 
-        let mut get_best_shreds_elapsed = Measure::start("get_best_orphans");
+        let mut get_best_shreds_elapsed = Measure::start("get_best_shreds");
         // Find the best incomplete slots in rooted subtree
         self.get_best_shreds(blockstore, &mut repairs, max_new_shreds, ignore_slots);
         get_best_shreds_elapsed.stop();
@@ -248,7 +248,7 @@ impl RepairWeight {
     fn get_best_shreds<'a>(
         &mut self,
         blockstore: &Blockstore,
-        repairs: &mut Vec<RepairType>,
+        repairs: &mut Vec<ShredRepairType>,
         max_new_shreds: usize,
         ignore_slots: &impl Contains<'a, Slot>,
     ) {
@@ -265,7 +265,7 @@ impl RepairWeight {
     fn get_best_orphans(
         &mut self,
         blockstore: &Blockstore,
-        repairs: &mut Vec<RepairType>,
+        repairs: &mut Vec<ShredRepairType>,
         epoch_stakes: &HashMap<Epoch, EpochStakes>,
         epoch_schedule: &EpochSchedule,
         max_new_orphans: usize,
@@ -306,7 +306,7 @@ impl RepairWeight {
                 if let Some(new_orphan_root) = new_orphan_root {
                     if new_orphan_root != self.root && !best_orphans.contains(&new_orphan_root) {
                         best_orphans.insert(new_orphan_root);
-                        repairs.push(RepairType::Orphan(new_orphan_root));
+                        repairs.push(ShredRepairType::Orphan(new_orphan_root));
                     }
                 }
             }
@@ -317,7 +317,7 @@ impl RepairWeight {
         if best_orphans.len() < max_new_orphans {
             for new_orphan in blockstore.orphans_iterator(self.root + 1).unwrap() {
                 if !best_orphans.contains(&new_orphan) {
-                    repairs.push(RepairType::Orphan(new_orphan));
+                    repairs.push(ShredRepairType::Orphan(new_orphan));
                     best_orphans.insert(new_orphan);
                 }
 
@@ -495,7 +495,7 @@ impl RepairWeight {
         for ((slot, _), _) in all_slots {
             *self
                 .slot_to_tree
-                .get_mut(&slot)
+                .get_mut(slot)
                 .expect("Nodes in tree must exist in `self.slot_to_tree`") = root2;
         }
     }
@@ -521,9 +521,9 @@ impl RepairWeight {
     fn sort_by_stake_weight_slot(slot_stake_voted: &mut Vec<(Slot, u64)>) {
         slot_stake_voted.sort_by(|(slot, stake_voted), (slot_, stake_voted_)| {
             if stake_voted == stake_voted_ {
-                slot.cmp(&slot_)
+                slot.cmp(slot_)
             } else {
-                stake_voted.cmp(&stake_voted_).reverse()
+                stake_voted.cmp(stake_voted_).reverse()
             }
         });
     }
@@ -573,7 +573,7 @@ mod test {
     fn test_add_votes() {
         let blockstore = setup_forks();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(3, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(3, stake);
         let votes = vec![(1, vote_pubkeys.clone())];
 
         let mut repair_weight = RepairWeight::new(0);
@@ -670,7 +670,7 @@ mod test {
     fn test_add_votes_orphans() {
         let blockstore = setup_orphans();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(3, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(3, stake);
         let votes = vec![(1, vote_pubkeys.clone()), (8, vote_pubkeys.clone())];
 
         let mut repair_weight = RepairWeight::new(0);
@@ -757,7 +757,7 @@ mod test {
         );
 
         for slot in &[8, 10, 11] {
-            assert_eq!(*repair_weight.slot_to_tree.get(&slot).unwrap(), 8);
+            assert_eq!(*repair_weight.slot_to_tree.get(slot).unwrap(), 8);
         }
         for slot in 0..=1 {
             assert_eq!(*repair_weight.slot_to_tree.get(&slot).unwrap(), 0);
@@ -772,7 +772,7 @@ mod test {
         );
 
         for slot in &[8, 10, 11] {
-            assert_eq!(*repair_weight.slot_to_tree.get(&slot).unwrap(), 0);
+            assert_eq!(*repair_weight.slot_to_tree.get(slot).unwrap(), 0);
         }
         assert_eq!(repair_weight.trees.len(), 1);
         assert!(repair_weight.trees.contains_key(&0));
@@ -782,7 +782,7 @@ mod test {
     fn test_update_orphan_ancestors() {
         let blockstore = setup_orphans();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(3, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(3, stake);
         // Create votes for both orphan branches
         let votes = vec![
             (10, vote_pubkeys[0..1].to_vec()),
@@ -839,7 +839,7 @@ mod test {
     fn test_get_best_orphans() {
         let blockstore = setup_orphans();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(2, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(2, stake);
         let votes = vec![(8, vec![vote_pubkeys[0]]), (20, vec![vote_pubkeys[1]])];
         let mut repair_weight = RepairWeight::new(0);
         repair_weight.add_votes(
@@ -947,7 +947,7 @@ mod test {
     fn test_get_extra_orphans() {
         let blockstore = setup_orphans();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(2, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(2, stake);
         let votes = vec![(8, vec![vote_pubkeys[0]])];
         let mut repair_weight = RepairWeight::new(0);
         repair_weight.add_votes(
@@ -1088,10 +1088,10 @@ mod test {
         let purged_slots = vec![0, 1, 2, 4, 8, 10];
         let mut expected_unrooted_len = 0;
         for purged_slot in &purged_slots {
-            assert!(!repair_weight.slot_to_tree.contains_key(&purged_slot));
-            assert!(!repair_weight.trees.contains_key(&purged_slot));
+            assert!(!repair_weight.slot_to_tree.contains_key(purged_slot));
+            assert!(!repair_weight.trees.contains_key(purged_slot));
             if *purged_slot > 3 {
-                assert!(repair_weight.unrooted_slots.contains(&purged_slot));
+                assert!(repair_weight.unrooted_slots.contains(purged_slot));
                 expected_unrooted_len += 1;
             }
         }
@@ -1249,7 +1249,7 @@ mod test {
     fn setup_orphan_repair_weight() -> (Blockstore, Bank, RepairWeight) {
         let blockstore = setup_orphans();
         let stake = 100;
-        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys(2, stake);
+        let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(2, stake);
 
         // Add votes for the main fork and orphan forks
         let votes = vec![

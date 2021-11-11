@@ -1,11 +1,15 @@
 use {
     crate::{
-        accounts_index::{AccountIndex, IndexKey},
+        accounts_index::{AccountIndex, IndexKey, ScanResult},
         bank::Bank,
     },
     log::*,
-    solana_sdk::{account::ReadableAccount, pubkey::Pubkey},
-    solana_stake_program::stake_state::StakeState,
+    solana_sdk::{
+        account::ReadableAccount,
+        pubkey::Pubkey,
+        stake::{self, state::StakeState},
+    },
+    solana_stake_program::stake_state,
     std::{collections::HashSet, sync::Arc},
 };
 
@@ -14,7 +18,7 @@ pub struct NonCirculatingSupply {
     pub accounts: Vec<Pubkey>,
 }
 
-pub fn calculate_non_circulating_supply(bank: &Arc<Bank>) -> NonCirculatingSupply {
+pub fn calculate_non_circulating_supply(bank: &Arc<Bank>) -> ScanResult<NonCirculatingSupply> {
     debug!("Updating Bank supply, epoch: {}", bank.epoch());
     let mut non_circulating_accounts_set: HashSet<Pubkey> = HashSet::new();
 
@@ -32,18 +36,19 @@ pub fn calculate_non_circulating_supply(bank: &Arc<Bank>) -> NonCirculatingSuppl
         .contains(&AccountIndex::ProgramId)
     {
         bank.get_filtered_indexed_accounts(
-            &IndexKey::ProgramId(solana_stake_program::id()),
+            &IndexKey::ProgramId(stake::program::id()),
             // The program-id account index checks for Account owner on inclusion. However, due to
             // the current AccountsDb implementation, an account may remain in storage as a
             // zero-lamport Account::Default() after being wiped and reinitialized in later
             // updates. We include the redundant filter here to avoid returning these accounts.
-            |account| account.owner() == &solana_stake_program::id(),
-        )
+            |account| account.owner() == &stake::program::id(),
+        )?
     } else {
-        bank.get_program_accounts(&solana_stake_program::id())
+        bank.get_program_accounts(&stake::program::id())?
     };
+
     for (pubkey, account) in stake_accounts.iter() {
-        let stake_account = StakeState::from(account).unwrap_or_default();
+        let stake_account = stake_state::from(account).unwrap_or_default();
         match stake_account {
             StakeState::Initialized(meta) => {
                 if meta.lockup.is_in_force(&clock, None)
@@ -65,13 +70,13 @@ pub fn calculate_non_circulating_supply(bank: &Arc<Bank>) -> NonCirculatingSuppl
 
     let lamports = non_circulating_accounts_set
         .iter()
-        .map(|pubkey| bank.get_balance(&pubkey))
+        .map(|pubkey| bank.get_balance(pubkey))
         .sum();
 
-    NonCirculatingSupply {
+    Ok(NonCirculatingSupply {
         lamports,
         accounts: non_circulating_accounts_set.into_iter().collect(),
-    }
+    })
 }
 
 // Mainnet-beta accounts that should be considered non-circulating
@@ -168,6 +173,25 @@ solana_sdk::pubkeys!(
         "AVYpwVou2BhdLivAwLxKPALZQsY7aZNkNmGbP2fZw7RU",
         "DrKzW5koKSZp4mg4BdHLwr72MMXscd2kTiWgckCvvPXz",
         "9hknftBZAQL4f48tWfk3bUEV5YSLcYYtDRqNmpNnhCWG",
+        "GLUmCeJpXB8veNcchPwibkRYwCwvQbKodex5mEjrgToi",
+        "9S2M3UYPpnPZTBtbcUvehYmiWFK3kBhwfzV2iWuwvaVy",
+        "HUAkU5psJXZuw54Lrg1ksbXzHv2fzczQ9sNbmisVMeJU",
+        "GK8R4uUmrawcREZ5xJy5dAzVV5V7aFvYg77id37pVTK",
+        "4vuWt1oHRqLMhf8Nv1zyEXZsYaeK7dipwrfKLoYU9Riq",
+        "EMhn1U3TMimW3bvWYbPUvN2eZnCfsuBN4LGWhzzYhiWR",
+        "BsKsunvENxAraBrL77UfAn1Gi7unVEmQAdCbhsjUN6tU",
+        "CTvhdUVf8KNyMbyEdnvRrBCHJjBKtQwkbj6zwoqcEssG",
+        "3fV2GaDKa3pZxyDcpMh5Vrh2FVAMUiWUKbYmnBFv8As3",
+        "4pV47TiPzZ7SSBPHmgUvSLmH9mMSe8tjyPhQZGbi1zPC",
+        "P8aKfWQPeRnsZtpBrwWTYzyAoRk74KMz56xc6NEpC4J",
+        "HuqDWJodFhAEWh6aWdsDVUqsjRket5DYXMYyDYtD8hdN",
+        "Ab1UcdsFXZVnkSt1Z3vcYU65GQk5MvCbs54SviaiaqHb",
+        "Dc2oHxFXQaC2QfLStuU7txtD3U5HZ82MrCSGDooWjbsv",
+        "3iPvAS4xdhYr6SkhVDHCLr7tJjMAFK4wvvHWJxFQVg15",
+        "GmyW1nqYcrw7P7JqrcyP9ivU9hYNbrgZ1r5SYJJH41Fs",
+        "E8jcgWvrvV7rwYHJThwfiBeQ8VAH4FgNEEMG9aAuCMAq",
+        "CY7X5o3Wi2eQhTocLmUS6JSWyx1NinBfW7AXRrkRCpi8",
+        "HQJtLqvEGGxgNYfRXUurfxV8E1swvCnsbC3456ik27HY",
     ]
 );
 
@@ -184,6 +208,7 @@ solana_sdk::pubkeys!(
         "GeMGyvsTEsANVvcT5cme65Xq5MVU8fVVzMQ13KAZFNS2",
         "Bj3aQ2oFnZYfNR1njzRjmWizzuhvfcYLckh76cqsbuBM",
         "4ZJhPQAgUseCsWhKvJLTmmRRUV74fdoTpQLNfKoekbPY",
+        "HXdYQ5gixrY2H6Y9gqsD8kPM2JQKSaRiohDQtLbZkRWE",
     ]
 );
 
@@ -195,8 +220,8 @@ mod tests {
         account::AccountSharedData,
         epoch_schedule::EpochSchedule,
         genesis_config::{ClusterType, GenesisConfig},
+        stake::state::{Authorized, Lockup, Meta},
     };
-    use solana_stake_program::stake_state::{Authorized, Lockup, Meta, StakeState};
     use std::{collections::BTreeMap, sync::Arc};
 
     fn new_from_parent(parent: &Arc<Bank>) -> Bank {
@@ -235,7 +260,7 @@ mod tests {
                 balance,
                 &StakeState::Initialized(meta),
                 std::mem::size_of::<StakeState>(),
-                &solana_stake_program::id(),
+                &stake::program::id(),
             )
             .unwrap();
             accounts.insert(pubkey, stake_account);
@@ -248,15 +273,15 @@ mod tests {
             cluster_type: ClusterType::MainnetBeta,
             ..GenesisConfig::default()
         };
-        let mut bank = Arc::new(Bank::new(&genesis_config));
-        let sysvar_and_native_program_delta = 10;
+        let mut bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let sysvar_and_native_program_delta = 11;
         assert_eq!(
             bank.capitalization(),
             (num_genesis_accounts + num_non_circulating_accounts + num_stake_accounts) * balance
                 + sysvar_and_native_program_delta,
         );
 
-        let non_circulating_supply = calculate_non_circulating_supply(&bank);
+        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             (num_non_circulating_accounts + num_stake_accounts) * balance
@@ -274,7 +299,7 @@ mod tests {
                 &AccountSharedData::new(new_balance, 0, &Pubkey::default()),
             );
         }
-        let non_circulating_supply = calculate_non_circulating_supply(&bank);
+        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             (num_non_circulating_accounts * new_balance) + (num_stake_accounts * balance)
@@ -289,7 +314,7 @@ mod tests {
             bank = Arc::new(new_from_parent(&bank));
         }
         assert_eq!(bank.epoch(), 1);
-        let non_circulating_supply = calculate_non_circulating_supply(&bank);
+        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             num_non_circulating_accounts * new_balance

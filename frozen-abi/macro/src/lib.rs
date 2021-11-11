@@ -224,7 +224,7 @@ fn do_derive_abi_enum_visitor(input: ItemEnum) -> TokenStream {
         if filter_serde_attrs(&variant.attrs) {
             continue;
         };
-        let sample_variant = quote_sample_variant(&type_name, &ty_generics, &variant);
+        let sample_variant = quote_sample_variant(type_name, &ty_generics, variant);
         variant_count = if let Some(variant_count) = variant_count.checked_add(1) {
             variant_count
         } else {
@@ -310,16 +310,13 @@ fn quote_for_test(
 
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 fn test_mod_name(type_name: &Ident) -> Ident {
-    Ident::new(
-        &format!("{}_frozen_abi", type_name.to_string()),
-        Span::call_site(),
-    )
+    Ident::new(&format!("{}_frozen_abi", type_name), Span::call_site())
 }
 
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 fn frozen_abi_type_alias(input: ItemType, expected_digest: &str) -> TokenStream {
     let type_name = &input.ident;
-    let test = quote_for_test(&test_mod_name(type_name), type_name, &expected_digest);
+    let test = quote_for_test(&test_mod_name(type_name), type_name, expected_digest);
     let result = quote! {
         #input
         #test
@@ -330,7 +327,7 @@ fn frozen_abi_type_alias(input: ItemType, expected_digest: &str) -> TokenStream 
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 fn frozen_abi_struct_type(input: ItemStruct, expected_digest: &str) -> TokenStream {
     let type_name = &input.ident;
-    let test = quote_for_test(&test_mod_name(type_name), type_name, &expected_digest);
+    let test = quote_for_test(&test_mod_name(type_name), type_name, expected_digest);
     let result = quote! {
         #input
         #test
@@ -387,7 +384,7 @@ fn quote_sample_variant(
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
 fn frozen_abi_enum_type(input: ItemEnum, expected_digest: &str) -> TokenStream {
     let type_name = &input.ident;
-    let test = quote_for_test(&test_mod_name(type_name), type_name, &expected_digest);
+    let test = quote_for_test(&test_mod_name(type_name), type_name, expected_digest);
     let result = quote! {
         #input
         #test

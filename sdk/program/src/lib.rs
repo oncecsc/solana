@@ -6,12 +6,14 @@
 extern crate self as solana_program;
 
 pub mod account_info;
+pub mod blake3;
 pub mod borsh;
 pub mod bpf_loader;
 pub mod bpf_loader_deprecated;
 pub mod bpf_loader_upgradeable;
 pub mod clock;
 pub mod decode_error;
+pub mod ed25519_program;
 pub mod entrypoint;
 pub mod entrypoint_deprecated;
 pub mod epoch_schedule;
@@ -38,15 +40,31 @@ pub mod pubkey;
 pub mod rent;
 pub mod sanitize;
 pub mod secp256k1_program;
+pub mod secp256k1_recover;
 pub mod serialize_utils;
 pub mod short_vec;
 pub mod slot_hashes;
 pub mod slot_history;
+pub mod stake;
 pub mod stake_history;
 pub mod system_instruction;
 pub mod system_program;
 pub mod sysvar;
 
+pub mod config {
+    pub mod program {
+        crate::declare_id!("Config1111111111111111111111111111111111111");
+    }
+}
+
+pub mod vote {
+    pub mod program {
+        crate::declare_id!("Vote111111111111111111111111111111111111111");
+    }
+}
+
+/// Same as `declare_id` except report that this id has been deprecated
+pub use solana_sdk_macro::program_declare_deprecated_id as declare_deprecated_id;
 /// Convenience macro to declare a static public key and functions to interact with it
 ///
 /// Input: a single literal base58 string representation of a program's id

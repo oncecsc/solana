@@ -1,5 +1,9 @@
-import React from "react";
-import { Account, useFetchAccountInfo } from "providers/accounts";
+import {
+  Account,
+  NFTData,
+  TokenProgramData,
+  useFetchAccountInfo,
+} from "providers/accounts";
 import {
   TokenAccount,
   MintAccountInfo,
@@ -11,7 +15,7 @@ import { TableCardBody } from "components/common/TableCardBody";
 import { Address } from "components/common/Address";
 import { UnknownAccountCard } from "./UnknownAccountCard";
 import { Cluster, useCluster } from "providers/cluster";
-import { normalizeTokenAmount } from "utils";
+import { abbreviatedNumber, normalizeTokenAmount } from "utils";
 import { addressLabel } from "utils/tx";
 import { reportError } from "utils/sentry";
 import { useTokenRegistry } from "providers/mints/token-registry";
@@ -19,6 +23,9 @@ import { BigNumber } from "bignumber.js";
 import { Copyable } from "components/common/Copyable";
 import { CoingeckoStatus, useCoinGecko } from "utils/coingecko";
 import { displayTimestampWithoutDate } from "utils/date";
+import { LoadingCard } from "components/common/LoadingCard";
+import { PublicKey } from "@solana/web3.js";
+import isMetaplexNFT from "providers/accounts/utils/isMetaplexNFT";
 
 const getEthAddress = (link?: string) => {
   let address = "";
@@ -46,7 +53,18 @@ export function TokenAccountSection({
     switch (tokenAccount.type) {
       case "mint": {
         const info = create(tokenAccount.info, MintAccountInfo);
-        return <MintAccountCard account={account} info={info} />;
+
+        if (isMetaplexNFT(account.details?.data, info)) {
+          return (
+            <NonFungibleTokenMintAccountCard
+              account={account}
+              nftData={(account.details!.data as TokenProgramData).nftData!}
+              mintInfo={info}
+            />
+          );
+        }
+
+        return <FungibleTokenMintAccountCard account={account} info={info} />;
       }
       case "account": {
         const info = create(tokenAccount.info, TokenAccountInfo);
@@ -67,7 +85,7 @@ export function TokenAccountSection({
   return <UnknownAccountCard account={account} />;
 }
 
-function MintAccountCard({
+function FungibleTokenMintAccountCard({
   account,
   info,
 }: {
@@ -95,17 +113,203 @@ function MintAccountCard({
   }
 
   return (
+    <>
+      {tokenInfo?.extensions?.coingeckoId &&
+        coinInfo?.status === CoingeckoStatus.Loading && (
+          <LoadingCard message="Loading token price data" />
+        )}
+      {tokenPriceInfo && tokenPriceInfo.price && (
+        <div className="row">
+          <div className="col-12 col-lg-4 col-xl">
+            <div className="card">
+              <div className="card-body">
+                <h4>
+                  Price{" "}
+                  <span className="ml-2 badge badge-primary rank">
+                    Rank #{tokenPriceInfo.market_cap_rank}
+                  </span>
+                </h4>
+                <h1 className="mb-0">
+                  ${tokenPriceInfo.price.toFixed(2)}{" "}
+                  {tokenPriceInfo.price_change_percentage_24h > 0 && (
+                    <small className="change-positive">
+                      &uarr;{" "}
+                      {tokenPriceInfo.price_change_percentage_24h.toFixed(2)}%
+                    </small>
+                  )}
+                  {tokenPriceInfo.price_change_percentage_24h < 0 && (
+                    <small className="change-negative">
+                      &darr;{" "}
+                      {tokenPriceInfo.price_change_percentage_24h.toFixed(2)}%
+                    </small>
+                  )}
+                  {tokenPriceInfo.price_change_percentage_24h === 0 && (
+                    <small>0%</small>
+                  )}
+                </h1>
+              </div>
+            </div>
+          </div>
+          <div className="col-12 col-lg-4 col-xl">
+            <div className="card">
+              <div className="card-body">
+                <h4>24 Hour Volume</h4>
+                <h1 className="mb-0">
+                  ${abbreviatedNumber(tokenPriceInfo.volume_24)}
+                </h1>
+              </div>
+            </div>
+          </div>
+          <div className="col-12 col-lg-4 col-xl">
+            <div className="card">
+              <div className="card-body">
+                <h4>Market Cap</h4>
+                <h1 className="mb-0">
+                  ${abbreviatedNumber(tokenPriceInfo.market_cap)}
+                </h1>
+                <p className="updated-time text-muted">
+                  Updated at{" "}
+                  {displayTimestampWithoutDate(
+                    tokenPriceInfo.last_updated.getTime()
+                  )}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="card">
+        <div className="card-header">
+          <h3 className="card-header-title mb-0 d-flex align-items-center">
+            {tokenInfo ? "Overview" : "Token Mint"}
+          </h3>
+          <button className="btn btn-white btn-sm" onClick={refresh}>
+            <span className="fe fe-refresh-cw mr-2"></span>
+            Refresh
+          </button>
+        </div>
+        <TableCardBody>
+          <tr>
+            <td>Address</td>
+            <td className="text-lg-right">
+              <Address pubkey={account.pubkey} alignRight raw />
+            </td>
+          </tr>
+          <tr>
+            <td>
+              {info.mintAuthority === null ? "Fixed Supply" : "Current Supply"}
+            </td>
+            <td className="text-lg-right">
+              {normalizeTokenAmount(info.supply, info.decimals).toLocaleString(
+                "en-US",
+                {
+                  minimumFractionDigits: info.decimals,
+                }
+              )}
+            </td>
+          </tr>
+          {tokenInfo?.extensions?.website && (
+            <tr>
+              <td>Website</td>
+              <td className="text-lg-right">
+                <a
+                  rel="noopener noreferrer"
+                  target="_blank"
+                  href={tokenInfo.extensions.website}
+                >
+                  {tokenInfo.extensions.website}
+                  <span className="fe fe-external-link ml-2"></span>
+                </a>
+              </td>
+            </tr>
+          )}
+          {info.mintAuthority && (
+            <tr>
+              <td>Mint Authority</td>
+              <td className="text-lg-right">
+                <Address pubkey={info.mintAuthority} alignRight link />
+              </td>
+            </tr>
+          )}
+          {info.freezeAuthority && (
+            <tr>
+              <td>Freeze Authority</td>
+              <td className="text-lg-right">
+                <Address pubkey={info.freezeAuthority} alignRight link />
+              </td>
+            </tr>
+          )}
+          <tr>
+            <td>Decimals</td>
+            <td className="text-lg-right">{info.decimals}</td>
+          </tr>
+          {!info.isInitialized && (
+            <tr>
+              <td>Status</td>
+              <td className="text-lg-right">Uninitialized</td>
+            </tr>
+          )}
+          {tokenInfo?.extensions?.bridgeContract && bridgeContractAddress && (
+            <tr>
+              <td>Bridge Contract</td>
+              <td className="text-lg-right">
+                <Copyable text={bridgeContractAddress}>
+                  <a
+                    href={tokenInfo.extensions.bridgeContract}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {bridgeContractAddress}
+                  </a>
+                </Copyable>
+              </td>
+            </tr>
+          )}
+          {tokenInfo?.extensions?.assetContract && assetContractAddress && (
+            <tr>
+              <td>Bridged Asset Contract</td>
+              <td className="text-lg-right">
+                <Copyable text={assetContractAddress}>
+                  <a
+                    href={tokenInfo.extensions.bridgeContract}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {assetContractAddress}
+                  </a>
+                </Copyable>
+              </td>
+            </tr>
+          )}
+        </TableCardBody>
+      </div>
+    </>
+  );
+}
+
+function NonFungibleTokenMintAccountCard({
+  account,
+  nftData,
+  mintInfo,
+}: {
+  account: Account;
+  nftData: NFTData;
+  mintInfo: MintAccountInfo;
+}) {
+  const fetchInfo = useFetchAccountInfo();
+  const refresh = () => fetchInfo(account.pubkey);
+
+  return (
     <div className="card">
       <div className="card-header">
         <h3 className="card-header-title mb-0 d-flex align-items-center">
-          {tokenInfo ? "Overview" : "Token Mint"}
+          Overview
         </h3>
         <button className="btn btn-white btn-sm" onClick={refresh}>
           <span className="fe fe-refresh-cw mr-2"></span>
           Refresh
         </button>
       </div>
-
       <TableCardBody>
         <tr>
           <td>Address</td>
@@ -113,107 +317,53 @@ function MintAccountCard({
             <Address pubkey={account.pubkey} alignRight raw />
           </td>
         </tr>
-        <tr>
-          <td>
-            {info.mintAuthority === null ? "Fixed Supply" : "Current Supply"}
-          </td>
-          <td className="text-lg-right">
-            {normalizeTokenAmount(info.supply, info.decimals).toFixed(
-              info.decimals
-            )}
-          </td>
-        </tr>
-        {tokenPriceInfo?.price && (
+        {nftData.editionInfo.masterEdition?.maxSupply && (
           <tr>
-            <td>Current Price</td>
+            <td>Max Total Supply</td>
             <td className="text-lg-right">
-              $
-              {tokenPriceInfo.price.toLocaleString("en-US", {
-                minimumFractionDigits: 2,
-              })}
+              {nftData.editionInfo.masterEdition.maxSupply.toNumber() === 0
+                ? 1
+                : nftData.editionInfo.masterEdition.maxSupply.toNumber()}
             </td>
           </tr>
         )}
-        {tokenInfo?.extensions?.website && (
+        {nftData?.editionInfo.masterEdition?.supply && (
           <tr>
-            <td>Website</td>
+            <td>Current Supply</td>
             <td className="text-lg-right">
-              <a
-                rel="noopener noreferrer"
-                target="_blank"
-                href={tokenInfo.extensions.website}
-              >
-                {tokenInfo.extensions.website}
-                <span className="fe fe-external-link ml-2"></span>
-              </a>
+              {nftData.editionInfo.masterEdition.supply.toNumber() === 0
+                ? 1
+                : nftData.editionInfo.masterEdition.supply.toNumber()}
             </td>
           </tr>
         )}
-        {info.mintAuthority && (
+        {mintInfo.mintAuthority && (
           <tr>
             <td>Mint Authority</td>
             <td className="text-lg-right">
-              <Address pubkey={info.mintAuthority} alignRight link />
-            </td>
-          </tr>
-        )}
-        {info.freezeAuthority && (
-          <tr>
-            <td>Freeze Authority</td>
-            <td className="text-lg-right">
-              <Address pubkey={info.freezeAuthority} alignRight link />
+              <Address pubkey={mintInfo.mintAuthority} alignRight link />
             </td>
           </tr>
         )}
         <tr>
-          <td>Decimals</td>
-          <td className="text-lg-right">{info.decimals}</td>
+          <td>Update Authority</td>
+          <td className="text-lg-right">
+            <Address
+              pubkey={new PublicKey(nftData.metadata.updateAuthority)}
+              alignRight
+              link
+            />
+          </td>
         </tr>
-        {!info.isInitialized && (
+        {nftData?.metadata.data && (
           <tr>
-            <td>Status</td>
-            <td className="text-lg-right">Uninitialized</td>
-          </tr>
-        )}
-        {tokenInfo?.extensions?.bridgeContract && bridgeContractAddress && (
-          <tr>
-            <td>Bridge Contract</td>
+            <td>Seller Fee</td>
             <td className="text-lg-right">
-              <Copyable text={bridgeContractAddress}>
-                <a
-                  href={tokenInfo.extensions.bridgeContract}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {bridgeContractAddress}
-                </a>
-              </Copyable>
-            </td>
-          </tr>
-        )}
-        {tokenInfo?.extensions?.assetContract && assetContractAddress && (
-          <tr>
-            <td>Bridged Asset Contract</td>
-            <td className="text-lg-right">
-              <Copyable text={assetContractAddress}>
-                <a
-                  href={tokenInfo.extensions.bridgeContract}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {assetContractAddress}
-                </a>
-              </Copyable>
+              {`${nftData?.metadata.data.sellerFeeBasisPoints / 100}%`}
             </td>
           </tr>
         )}
       </TableCardBody>
-      {tokenPriceInfo && (
-        <p className="updated-time text-muted mr-4">
-          Price updated at{" "}
-          {displayTimestampWithoutDate(tokenPriceInfo.last_updated.getTime())}
-        </p>
-      )}
     </div>
   );
 }

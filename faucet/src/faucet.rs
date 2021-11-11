@@ -84,16 +84,6 @@ pub enum FaucetRequest {
     },
 }
 
-impl Default for FaucetRequest {
-    fn default() -> Self {
-        Self::GetAirdrop {
-            lamports: u64::default(),
-            to: Pubkey::default(),
-            blockhash: Hash::default(),
-        }
-    }
-}
-
 pub enum FaucetTransaction {
     Airdrop(Transaction),
     Memo((Transaction, String)),
@@ -416,7 +406,15 @@ async fn process(
     mut stream: TokioTcpStream,
     faucet: Arc<Mutex<Faucet>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut request = vec![0u8; serialized_size(&FaucetRequest::default()).unwrap() as usize];
+    let mut request = vec![
+        0u8;
+        serialized_size(&FaucetRequest::GetAirdrop {
+            lamports: u64::default(),
+            to: Pubkey::default(),
+            blockhash: Hash::default(),
+        })
+        .unwrap() as usize
+    ];
     while stream.read_exact(&mut request).await.is_ok() {
         trace!("{:?}", request);
 
@@ -654,7 +652,7 @@ mod tests {
     #[test]
     fn test_process_faucet_request() {
         let to = solana_sdk::pubkey::new_rand();
-        let blockhash = Hash::new(&to.as_ref());
+        let blockhash = Hash::new(to.as_ref());
         let lamports = 50;
         let req = FaucetRequest::GetAirdrop {
             lamports,
@@ -679,6 +677,6 @@ mod tests {
         assert_eq!(expected_vec_with_length, response_vec);
 
         let bad_bytes = "bad bytes".as_bytes();
-        assert!(faucet.process_faucet_request(&bad_bytes, ip).is_err());
+        assert!(faucet.process_faucet_request(bad_bytes, ip).is_err());
     }
 }

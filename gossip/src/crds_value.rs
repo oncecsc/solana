@@ -71,7 +71,7 @@ impl Signable for CrdsValue {
 
     fn verify(&self) -> bool {
         self.get_signature()
-            .verify(&self.pubkey().as_ref(), self.signable_data().borrow())
+            .verify(self.pubkey().as_ref(), self.signable_data().borrow())
     }
 }
 
@@ -83,14 +83,15 @@ impl Signable for CrdsValue {
 pub enum CrdsData {
     ContactInfo(ContactInfo),
     Vote(VoteIndex, Vote),
-    LowestSlot(u8, LowestSlot),
-    SnapshotHashes(SnapshotHash),
-    AccountsHashes(SnapshotHash),
+    LowestSlot(/*DEPRECATED:*/ u8, LowestSlot),
+    SnapshotHashes(SnapshotHashes),
+    AccountsHashes(SnapshotHashes),
     EpochSlots(EpochSlotsIndex, EpochSlots),
     LegacyVersion(LegacyVersion),
     Version(Version),
     NodeInstance(NodeInstance),
     DuplicateShred(DuplicateShredIndex, DuplicateShred),
+    IncrementalSnapshotHashes(IncrementalSnapshotHashes),
 }
 
 impl Sanitize for CrdsData {
@@ -127,6 +128,7 @@ impl Sanitize for CrdsData {
                     shred.sanitize()
                 }
             }
+            CrdsData::IncrementalSnapshotHashes(val) => val.sanitize(),
         }
     }
 }
@@ -147,8 +149,8 @@ impl CrdsData {
         match kind {
             0 => CrdsData::ContactInfo(ContactInfo::new_rand(rng, pubkey)),
             1 => CrdsData::LowestSlot(rng.gen(), LowestSlot::new_rand(rng, pubkey)),
-            2 => CrdsData::SnapshotHashes(SnapshotHash::new_rand(rng, pubkey)),
-            3 => CrdsData::AccountsHashes(SnapshotHash::new_rand(rng, pubkey)),
+            2 => CrdsData::SnapshotHashes(SnapshotHashes::new_rand(rng, pubkey)),
+            3 => CrdsData::AccountsHashes(SnapshotHashes::new_rand(rng, pubkey)),
             4 => CrdsData::Version(Version::new_rand(rng, pubkey)),
             5 => CrdsData::Vote(rng.gen_range(0, MAX_VOTES), Vote::new_rand(rng, pubkey)),
             _ => CrdsData::EpochSlots(
@@ -160,13 +162,13 @@ impl CrdsData {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample)]
-pub struct SnapshotHash {
+pub struct SnapshotHashes {
     pub from: Pubkey,
     pub hashes: Vec<(Slot, Hash)>,
     pub wallclock: u64,
 }
 
-impl Sanitize for SnapshotHash {
+impl Sanitize for SnapshotHashes {
     fn sanitize(&self) -> Result<(), SanitizeError> {
         sanitize_wallclock(self.wallclock)?;
         for (slot, _) in &self.hashes {
@@ -178,7 +180,7 @@ impl Sanitize for SnapshotHash {
     }
 }
 
-impl SnapshotHash {
+impl SnapshotHashes {
     pub fn new(from: Pubkey, hashes: Vec<(Slot, Hash)>) -> Self {
         Self {
             from,
@@ -187,7 +189,7 @@ impl SnapshotHash {
         }
     }
 
-    /// New random SnapshotHash for tests and benchmarks.
+    /// New random SnapshotHashes for tests and benchmarks.
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
         let num_hashes = rng.gen_range(0, MAX_SNAPSHOT_HASHES) + 1;
         let hashes = std::iter::repeat_with(|| {
@@ -204,6 +206,33 @@ impl SnapshotHash {
         }
     }
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample)]
+pub struct IncrementalSnapshotHashes {
+    pub from: Pubkey,
+    pub base: (Slot, Hash),
+    pub hashes: Vec<(Slot, Hash)>,
+    pub wallclock: u64,
+}
+
+impl Sanitize for IncrementalSnapshotHashes {
+    fn sanitize(&self) -> Result<(), SanitizeError> {
+        sanitize_wallclock(self.wallclock)?;
+        if self.base.0 >= MAX_SLOT {
+            return Err(SanitizeError::ValueOutOfBounds);
+        }
+        for (slot, _) in &self.hashes {
+            if *slot >= MAX_SLOT {
+                return Err(SanitizeError::ValueOutOfBounds);
+            }
+            if self.base.0 >= *slot {
+                return Err(SanitizeError::InvalidValue);
+            }
+        }
+        self.from.sanitize()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample)]
 pub struct LowestSlot {
     pub from: Pubkey,
@@ -395,12 +424,12 @@ pub struct NodeInstance {
 }
 
 impl NodeInstance {
-    pub fn new<R>(rng: &mut R, pubkey: Pubkey, now: u64) -> Self
+    pub fn new<R>(rng: &mut R, from: Pubkey, now: u64) -> Self
     where
         R: Rng + CryptoRng,
     {
         Self {
-            from: pubkey,
+            from,
             wallclock: now,
             timestamp: now,
             token: rng.gen(),
@@ -408,11 +437,8 @@ impl NodeInstance {
     }
 
     // Clones the value with an updated wallclock.
-    pub(crate) fn with_wallclock(&self, now: u64) -> Self {
-        Self {
-            wallclock: now,
-            ..*self
-        }
+    pub(crate) fn with_wallclock(&self, wallclock: u64) -> Self {
+        Self { wallclock, ..*self }
     }
 
     // Returns true if the crds-value is a duplicate instance
@@ -470,6 +496,7 @@ pub enum CrdsValueLabel {
     Version(Pubkey),
     NodeInstance(Pubkey),
     DuplicateShred(DuplicateShredIndex, Pubkey),
+    IncrementalSnapshotHashes(Pubkey),
 }
 
 impl fmt::Display for CrdsValueLabel {
@@ -478,13 +505,16 @@ impl fmt::Display for CrdsValueLabel {
             CrdsValueLabel::ContactInfo(_) => write!(f, "ContactInfo({})", self.pubkey()),
             CrdsValueLabel::Vote(ix, _) => write!(f, "Vote({}, {})", ix, self.pubkey()),
             CrdsValueLabel::LowestSlot(_) => write!(f, "LowestSlot({})", self.pubkey()),
-            CrdsValueLabel::SnapshotHashes(_) => write!(f, "SnapshotHash({})", self.pubkey()),
+            CrdsValueLabel::SnapshotHashes(_) => write!(f, "SnapshotHashes({})", self.pubkey()),
             CrdsValueLabel::EpochSlots(ix, _) => write!(f, "EpochSlots({}, {})", ix, self.pubkey()),
             CrdsValueLabel::AccountsHashes(_) => write!(f, "AccountsHashes({})", self.pubkey()),
             CrdsValueLabel::LegacyVersion(_) => write!(f, "LegacyVersion({})", self.pubkey()),
             CrdsValueLabel::Version(_) => write!(f, "Version({})", self.pubkey()),
             CrdsValueLabel::NodeInstance(pk) => write!(f, "NodeInstance({})", pk),
             CrdsValueLabel::DuplicateShred(ix, pk) => write!(f, "DuplicateShred({}, {})", ix, pk),
+            CrdsValueLabel::IncrementalSnapshotHashes(_) => {
+                write!(f, "IncrementalSnapshotHashes({})", self.pubkey())
+            }
         }
     }
 }
@@ -502,6 +532,7 @@ impl CrdsValueLabel {
             CrdsValueLabel::Version(p) => *p,
             CrdsValueLabel::NodeInstance(p) => *p,
             CrdsValueLabel::DuplicateShred(_, p) => *p,
+            CrdsValueLabel::IncrementalSnapshotHashes(p) => *p,
         }
     }
 }
@@ -550,6 +581,7 @@ impl CrdsValue {
             CrdsData::Version(version) => version.wallclock,
             CrdsData::NodeInstance(node) => node.wallclock,
             CrdsData::DuplicateShred(_, shred) => shred.wallclock,
+            CrdsData::IncrementalSnapshotHashes(hash) => hash.wallclock,
         }
     }
     pub fn pubkey(&self) -> Pubkey {
@@ -564,6 +596,7 @@ impl CrdsValue {
             CrdsData::Version(version) => version.from,
             CrdsData::NodeInstance(node) => node.from,
             CrdsData::DuplicateShred(_, shred) => shred.from,
+            CrdsData::IncrementalSnapshotHashes(hash) => hash.from,
         }
     }
     pub fn label(&self) -> CrdsValueLabel {
@@ -578,6 +611,9 @@ impl CrdsValue {
             CrdsData::Version(_) => CrdsValueLabel::Version(self.pubkey()),
             CrdsData::NodeInstance(node) => CrdsValueLabel::NodeInstance(node.from),
             CrdsData::DuplicateShred(ix, shred) => CrdsValueLabel::DuplicateShred(*ix, shred.from),
+            CrdsData::IncrementalSnapshotHashes(_) => {
+                CrdsValueLabel::IncrementalSnapshotHashes(self.pubkey())
+            }
         }
     }
     pub fn contact_info(&self) -> Option<&ContactInfo> {
@@ -587,52 +623,16 @@ impl CrdsValue {
         }
     }
 
-    #[cfg(test)]
-    fn vote(&self) -> Option<&Vote> {
-        match &self.data {
-            CrdsData::Vote(_, vote) => Some(vote),
-            _ => None,
-        }
-    }
-
-    pub fn lowest_slot(&self) -> Option<&LowestSlot> {
-        match &self.data {
-            CrdsData::LowestSlot(_, slots) => Some(slots),
-            _ => None,
-        }
-    }
-
-    pub fn snapshot_hash(&self) -> Option<&SnapshotHash> {
-        match &self.data {
-            CrdsData::SnapshotHashes(slots) => Some(slots),
-            _ => None,
-        }
-    }
-
-    pub fn accounts_hash(&self) -> Option<&SnapshotHash> {
+    pub(crate) fn accounts_hash(&self) -> Option<&SnapshotHashes> {
         match &self.data {
             CrdsData::AccountsHashes(slots) => Some(slots),
             _ => None,
         }
     }
 
-    pub fn epoch_slots(&self) -> Option<&EpochSlots> {
+    pub(crate) fn epoch_slots(&self) -> Option<&EpochSlots> {
         match &self.data {
             CrdsData::EpochSlots(_, slots) => Some(slots),
-            _ => None,
-        }
-    }
-
-    pub fn legacy_version(&self) -> Option<&LegacyVersion> {
-        match &self.data {
-            CrdsData::LegacyVersion(legacy_version) => Some(legacy_version),
-            _ => None,
-        }
-    }
-
-    pub fn version(&self) -> Option<&Version> {
-        match &self.data {
-            CrdsData::Version(version) => Some(version),
             _ => None,
         }
     }
@@ -644,7 +644,7 @@ impl CrdsValue {
 
     /// Returns true if, regardless of prunes, this crds-value
     /// should be pushed to the receiving node.
-    pub fn should_force_push(&self, peer: &Pubkey) -> bool {
+    pub(crate) fn should_force_push(&self, peer: &Pubkey) -> bool {
         match &self.data {
             CrdsData::NodeInstance(node) => node.from == *peer,
             _ => false,
@@ -713,7 +713,10 @@ mod test {
             Vote::new(Pubkey::default(), test_tx(), 0),
         ));
         assert_eq!(v.wallclock(), 0);
-        let key = v.vote().unwrap().from;
+        let key = match &v.data {
+            CrdsData::Vote(_, vote) => vote.from,
+            _ => panic!(),
+        };
         assert_eq!(v.label(), CrdsValueLabel::Vote(0, key));
 
         let v = CrdsValue::new_unsigned(CrdsData::LowestSlot(
@@ -721,7 +724,10 @@ mod test {
             LowestSlot::new(Pubkey::default(), 0, 0),
         ));
         assert_eq!(v.wallclock(), 0);
-        let key = v.lowest_slot().unwrap().from;
+        let key = match &v.data {
+            CrdsData::LowestSlot(_, data) => data.from,
+            _ => panic!(),
+        };
         assert_eq!(v.label(), CrdsValueLabel::LowestSlot(key));
     }
 
@@ -853,9 +859,9 @@ mod test {
         wrong_keypair: &Keypair,
     ) {
         assert!(!value.verify());
-        value.sign(&correct_keypair);
+        value.sign(correct_keypair);
         assert!(value.verify());
-        value.sign(&wrong_keypair);
+        value.sign(wrong_keypair);
         assert!(!value.verify());
         serialize_deserialize_value(value, correct_keypair);
     }

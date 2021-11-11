@@ -1,5 +1,8 @@
-//! Persistent storage for accounts. For more information, see:
-//! https://docs.solana.com/implemented-proposals/persistent-account-storage
+//! Persistent storage for accounts.
+//!
+//! For more information, see:
+//!
+//! <https://docs.solana.com/implemented-proposals/persistent-account-storage>
 
 use log::*;
 use memmap2::MmapMut;
@@ -305,7 +308,14 @@ impl AppendVec {
         let file_size = std::fs::metadata(&path)?.len();
         AppendVec::sanitize_len_and_size(current_len, file_size as usize)?;
 
-        let map = unsafe { MmapMut::map_mut(&data)? };
+        let map = unsafe {
+            let result = MmapMut::map_mut(&data);
+            if result.is_err() {
+                // for vm.max_map_count, error is: {code: 12, kind: Other, message: "Cannot allocate memory"}
+                info!("memory map error: {:?}. This may be because vm.max_map_count is not set correctly.", result);
+            }
+            result?
+        };
 
         let new = AppendVec {
             path: path.as_ref().to_path_buf(),
@@ -771,7 +781,7 @@ pub mod tests {
     fn test_new_from_file_crafted_zero_lamport_account() {
         let file = get_append_vec_path("test_append");
         let path = &file.path;
-        let mut av = AppendVec::new(&path, true, 1024 * 1024);
+        let mut av = AppendVec::new(path, true, 1024 * 1024);
         av.set_no_remove_on_drop();
 
         let pubkey = solana_sdk::pubkey::new_rand();
@@ -799,7 +809,7 @@ pub mod tests {
     fn test_new_from_file_crafted_data_len() {
         let file = get_append_vec_path("test_new_from_file_crafted_data_len");
         let path = &file.path;
-        let mut av = AppendVec::new(&path, true, 1024 * 1024);
+        let mut av = AppendVec::new(path, true, 1024 * 1024);
         av.set_no_remove_on_drop();
 
         let crafted_data_len = 1;
@@ -827,7 +837,7 @@ pub mod tests {
     fn test_new_from_file_too_large_data_len() {
         let file = get_append_vec_path("test_new_from_file_too_large_data_len");
         let path = &file.path;
-        let mut av = AppendVec::new(&path, true, 1024 * 1024);
+        let mut av = AppendVec::new(path, true, 1024 * 1024);
         av.set_no_remove_on_drop();
 
         let too_large_data_len = u64::max_value();
@@ -853,7 +863,7 @@ pub mod tests {
     fn test_new_from_file_crafted_executable() {
         let file = get_append_vec_path("test_new_from_crafted_executable");
         let path = &file.path;
-        let mut av = AppendVec::new(&path, true, 1024 * 1024);
+        let mut av = AppendVec::new(path, true, 1024 * 1024);
         av.set_no_remove_on_drop();
         av.append_account_test(&create_test_account(10)).unwrap();
         {
@@ -885,6 +895,7 @@ pub mod tests {
             // assert_eq! thinks *executable_bool is equal to false but the if condition thinks it's not, contradictorily.
             assert!(!*executable_bool);
             const FALSE: bool = false; // keep clippy happy
+            #[allow(clippy::if_then_panic)]
             if *executable_bool == FALSE {
                 panic!("This didn't occur if this test passed.");
             }

@@ -96,6 +96,35 @@ function get_bootstrap_validator_ip_address {
   echo "${validatorIpList[0]}"
 }
 
+function get_active_stake {
+  source "${REPO_ROOT}"/net/common.sh
+  loadConfigFile
+  ssh "${sshOptions[@]}" "${validatorIpList[0]}" \
+    '$HOME/.cargo/bin/solana --url http://127.0.0.1:8899 validators --output=json | grep -o "totalActiveStake\": [0-9]*" | cut -d: -f2'
+}
+
+function get_current_stake {
+  source "${REPO_ROOT}"/net/common.sh
+  loadConfigFile
+  ssh "${sshOptions[@]}" "${validatorIpList[0]}" \
+    '$HOME/.cargo/bin/solana --url http://127.0.0.1:8899 validators --output=json | grep -o "totalCurrentStake\": [0-9]*" | cut -d: -f2'
+}
+
+function get_validator_confirmation_time {
+  SINCE=$1
+  declare q_mean_confirmation='
+    SELECT ROUND(MEAN("duration_ms")) as "mean_confirmation_ms"
+      FROM "'$TESTNET_TAG'"."autogen"."validator-confirmation"
+      WHERE time > now() - '"$SINCE"'s'
+
+  mean_confirmation_ms=$( \
+      curl -G "${INFLUX_HOST}/query?u=ro&p=topsecret" \
+        --data-urlencode "db=${TESTNET_TAG}" \
+        --data-urlencode "q=$q_mean_confirmation" |
+      python3 "${REPO_ROOT}"/system-test/testnet-automation-json-parser.py --empty_error |
+      cut -d' ' -f2)
+}
+
 function collect_performance_statistics {
   execution_step "Collect performance statistics about run"
   declare q_mean_tps='
@@ -149,7 +178,7 @@ function collect_performance_statistics {
   curl -G "${INFLUX_HOST}/query?u=ro&p=topsecret" \
     --data-urlencode "db=${TESTNET_TAG}" \
     --data-urlencode "q=$q_mean_tps;$q_max_tps;$q_mean_confirmation;$q_max_confirmation;$q_99th_confirmation;$q_max_tower_distance_observed;$q_last_tower_distance_observed" |
-    python "${REPO_ROOT}"/system-test/testnet-automation-json-parser.py >>"$RESULT_FILE"
+    python3 "${REPO_ROOT}"/system-test/testnet-automation-json-parser.py >>"$RESULT_FILE"
 
   declare q_dropped_vote_hash_count='
     SELECT sum("count") as "sum_dropped_vote_hash"
@@ -161,7 +190,7 @@ function collect_performance_statistics {
   curl -G "${INFLUX_HOST}/query?u=ro&p=topsecret" \
     --data-urlencode "db=${TESTNET_TAG}" \
     --data-urlencode "q=$q_dropped_vote_hash_count" |
-    python "${REPO_ROOT}"/system-test/testnet-automation-json-parser-missing.py)
+    python3 "${REPO_ROOT}"/system-test/testnet-automation-json-parser-missing.py)
 }
 
 function upload_results_to_slack() {

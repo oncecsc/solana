@@ -66,7 +66,7 @@ impl FromStr for ClusterType {
     }
 }
 
-#[frozen_abi(digest = "FX48h9vjJZPvka4J9UvcPQkVcMdYLQujhbvUmVFq6qLx")]
+#[frozen_abi(digest = "3V3ZVRyzNhRfe8RJwDeGpeTP8xBWGGFBEbwTkvKKVjEa")]
 #[derive(Serialize, Deserialize, Debug, Clone, AbiExample)]
 pub struct GenesisConfig {
     /// when the network (bootstrap validator) was started relative to the UNIX Epoch
@@ -160,7 +160,7 @@ impl GenesisConfig {
     }
 
     pub fn load(ledger_path: &Path) -> Result<Self, std::io::Error> {
-        let filename = Self::genesis_filename(&ledger_path);
+        let filename = Self::genesis_filename(ledger_path);
         let file = OpenOptions::new()
             .read(true)
             .open(&filename)
@@ -198,7 +198,7 @@ impl GenesisConfig {
 
         std::fs::create_dir_all(&ledger_path)?;
 
-        let mut file = File::create(Self::genesis_filename(&ledger_path))?;
+        let mut file = File::create(Self::genesis_filename(ledger_path))?;
         file.write_all(&serialized)
     }
 
@@ -277,9 +277,7 @@ impl fmt::Display for GenesisConfig {
                 self.accounts
                     .iter()
                     .map(|(pubkey, account)| {
-                        if account.lamports == 0 {
-                            panic!("{:?}", (pubkey, account));
-                        }
+                        assert!(account.lamports > 0, "{:?}", (pubkey, account));
                         account.lamports
                     })
                     .sum::<u64>()
@@ -339,8 +337,8 @@ mod tests {
                 && account.lamports == 10_000));
 
         let path = &make_tmp_path("genesis_config");
-        config.write(&path).expect("write");
-        let loaded_config = GenesisConfig::load(&path).expect("load");
+        config.write(path).expect("write");
+        let loaded_config = GenesisConfig::load(path).expect("load");
         assert_eq!(config.hash(), loaded_config.hash());
         let _ignored = std::fs::remove_file(&path);
     }

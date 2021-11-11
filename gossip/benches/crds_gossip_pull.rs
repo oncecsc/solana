@@ -7,11 +7,12 @@ use {
     rayon::ThreadPoolBuilder,
     solana_gossip::{
         cluster_info::MAX_BLOOM_SIZE,
-        crds::Crds,
+        crds::{Crds, GossipRoute},
         crds_gossip_pull::{CrdsFilter, CrdsGossipPull},
         crds_value::CrdsValue,
     },
     solana_sdk::hash,
+    std::sync::RwLock,
     test::Bencher,
 };
 
@@ -38,13 +39,18 @@ fn bench_build_crds_filters(bencher: &mut Bencher) {
     let mut num_inserts = 0;
     for _ in 0..90_000 {
         if crds
-            .insert(CrdsValue::new_rand(&mut rng, None), rng.gen())
+            .insert(
+                CrdsValue::new_rand(&mut rng, None),
+                rng.gen(),
+                GossipRoute::LocalMessage,
+            )
             .is_ok()
         {
             num_inserts += 1;
         }
     }
     assert_eq!(num_inserts, 90_000);
+    let crds = RwLock::new(crds);
     bencher.iter(|| {
         let filters = crds_gossip_pull.build_crds_filters(&thread_pool, &crds, MAX_BLOOM_SIZE);
         assert_eq!(filters.len(), 128);

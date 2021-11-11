@@ -7,7 +7,7 @@ import {
   usePerformanceInfo,
   useStatsProvider,
 } from "providers/stats/solanaClusterStats";
-import { lamportsToSol, slotsToHumanString } from "utils";
+import { abbreviatedNumber, lamportsToSol, slotsToHumanString } from "utils";
 import { ClusterStatus, useCluster } from "providers/cluster";
 import { TpsCard } from "components/TpsCard";
 import { displayTimestampWithoutDate, displayTimestampUtc } from "utils/date";
@@ -16,6 +16,7 @@ import { ErrorCard } from "components/common/ErrorCard";
 import { LoadingCard } from "components/common/LoadingCard";
 import { useVoteAccounts } from "providers/accounts/vote-accounts";
 import { CoingeckoStatus, useCoinGecko } from "utils/coingecko";
+import { Epoch } from "components/common/Epoch";
 
 const CLUSTER_STATS_TIMEOUT = 5000;
 
@@ -82,7 +83,7 @@ function StakingComponent() {
   }
 
   if (supply === Status.Idle || supply === Status.Connecting || !coinInfo) {
-    return <LoadingCard />;
+    return <LoadingCard message="Loading supply and price data" />;
   } else if (typeof supply === "string") {
     return <ErrorCard text={supply} retry={fetchData} />;
   }
@@ -105,10 +106,10 @@ function StakingComponent() {
   }
 
   return (
-    <div className="card staking-card">
-      <div className="card-body">
-        <div className="d-flex flex-md-row flex-column">
-          <div className="p-2 flex-fill">
+    <div className="row staking-card">
+      <div className="col-12 col-lg-4 col-xl">
+        <div className="card">
+          <div className="card-body">
             <h4>Circulating Supply</h4>
             <h1>
               <em>{displayLamports(supply.circulating)}</em> /{" "}
@@ -118,8 +119,11 @@ function StakingComponent() {
               <em>{circulatingPercentage}%</em> is circulating
             </h5>
           </div>
-          <hr className="hidden-sm-up" />
-          <div className="p-2 flex-fill">
+        </div>
+      </div>
+      <div className="col-12 col-lg-4 col-xl">
+        <div className="card">
+          <div className="card-body">
             <h4>Active Stake</h4>
             {activeStake && (
               <h1>
@@ -133,65 +137,64 @@ function StakingComponent() {
               </h5>
             )}
           </div>
-          <hr className="hidden-sm-up" />
-          {solanaInfo && (
-            <div className="p-2 flex-fill">
-              <h4>
-                Price{" "}
-                <span className="ml-2 badge badge-primary rank">
-                  Rank #{solanaInfo.market_cap_rank}
-                </span>
-              </h4>
-              <h1>
-                <em>${solanaInfo.price.toFixed(2)}</em>{" "}
-                {solanaInfo.price_change_percentage_24h > 0 && (
-                  <small className="change-positive">
-                    &uarr; {solanaInfo.price_change_percentage_24h.toFixed(2)}%
-                  </small>
-                )}
-                {solanaInfo.price_change_percentage_24h < 0 && (
-                  <small className="change-negative">
-                    &darr; {solanaInfo.price_change_percentage_24h.toFixed(2)}%
-                  </small>
-                )}
-                {solanaInfo.price_change_percentage_24h === 0 && (
-                  <small>0%</small>
-                )}
-              </h1>
-              <h5>
-                24h Vol: <em>${abbreviatedNumber(solanaInfo.volume_24)}</em>{" "}
-                MCap: <em>${abbreviatedNumber(solanaInfo.market_cap)}</em>
-              </h5>
-            </div>
-          )}
-          {coinInfo.status === CoingeckoStatus.FetchFailed && (
-            <div className="p-2 flex-fill">
-              <h4>Price</h4>
-              <h1>
-                <em>$--.--</em>
-              </h1>
-              <h5>Error fetching the latest price information</h5>
-            </div>
-          )}
         </div>
-        {solanaInfo && (
-          <p className="updated-time text-muted mb-0">
-            Updated at{" "}
-            {displayTimestampWithoutDate(solanaInfo.last_updated.getTime())}
-          </p>
-        )}
+      </div>
+      <div className="col-12 col-lg-4 col-xl">
+        <div className="card">
+          <div className="card-body">
+            {solanaInfo && (
+              <>
+                <h4>
+                  Price{" "}
+                  <span className="ml-2 badge badge-primary rank">
+                    Rank #{solanaInfo.market_cap_rank}
+                  </span>
+                </h4>
+                <h1>
+                  <em>${solanaInfo.price.toFixed(2)}</em>{" "}
+                  {solanaInfo.price_change_percentage_24h > 0 && (
+                    <small className="change-positive">
+                      &uarr; {solanaInfo.price_change_percentage_24h.toFixed(2)}
+                      %
+                    </small>
+                  )}
+                  {solanaInfo.price_change_percentage_24h < 0 && (
+                    <small className="change-negative">
+                      &darr; {solanaInfo.price_change_percentage_24h.toFixed(2)}
+                      %
+                    </small>
+                  )}
+                  {solanaInfo.price_change_percentage_24h === 0 && (
+                    <small>0%</small>
+                  )}
+                </h1>
+                <h5>
+                  24h Vol: <em>${abbreviatedNumber(solanaInfo.volume_24)}</em>{" "}
+                  MCap: <em>${abbreviatedNumber(solanaInfo.market_cap)}</em>
+                </h5>
+              </>
+            )}
+            {coinInfo.status === CoingeckoStatus.FetchFailed && (
+              <>
+                <h4>Price</h4>
+                <h1>
+                  <em>$--.--</em>
+                </h1>
+                <h5>Error fetching the latest price information</h5>
+              </>
+            )}
+            {solanaInfo && (
+              <p className="updated-time text-muted">
+                Updated at{" "}
+                {displayTimestampWithoutDate(solanaInfo.last_updated.getTime())}
+              </p>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
 }
-
-const abbreviatedNumber = (value: number, fixed = 1) => {
-  if (value < 1e3) return value;
-  if (value >= 1e3 && value < 1e6) return +(value / 1e3).toFixed(fixed) + "K";
-  if (value >= 1e6 && value < 1e9) return +(value / 1e6).toFixed(fixed) + "M";
-  if (value >= 1e9 && value < 1e12) return +(value / 1e9).toFixed(fixed) + "B";
-  if (value >= 1e12) return +(value / 1e12).toFixed(fixed) + "T";
-};
 
 function displayLamports(value: number) {
   return abbreviatedNumber(lamportsToSol(value));
@@ -223,7 +226,6 @@ function StatsCardBody() {
   const hourlySlotTime = Math.round(1000 * avgSlotTime_1h);
   const averageSlotTime = Math.round(1000 * avgSlotTime_1min);
   const { slotIndex, slotsInEpoch } = epochInfo;
-  const currentEpoch = epochInfo.epoch.toString();
   const epochProgress = ((100 * slotIndex) / slotsInEpoch).toFixed(1) + "%";
   const epochTimeRemaining = slotsToHumanString(
     slotsInEpoch - slotIndex,
@@ -265,7 +267,9 @@ function StatsCardBody() {
       </tr>
       <tr>
         <td className="w-100">Epoch</td>
-        <td className="text-lg-right text-monospace">{currentEpoch}</td>
+        <td className="text-lg-right text-monospace">
+          <Epoch epoch={epochInfo.epoch} link />
+        </td>
       </tr>
       <tr>
         <td className="w-100">Epoch progress</td>

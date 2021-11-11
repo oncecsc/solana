@@ -1,6 +1,6 @@
 use {
-    clap::{value_t, value_t_or_exit, App, Arg},
-    fd_lock::FdLock,
+    clap::{crate_name, value_t, value_t_or_exit, App, Arg},
+    log::*,
     solana_clap_utils::{
         input_parsers::{pubkey_of, pubkeys_of, value_of},
         input_validators::{
@@ -9,21 +9,24 @@ use {
         },
     },
     solana_client::rpc_client::RpcClient,
-    solana_core::rpc::JsonRpcConfig,
+    solana_core::tower_storage::FileTowerStorage,
     solana_faucet::faucet::{run_local_faucet_with_port, FAUCET_PORT},
+    solana_rpc::rpc::JsonRpcConfig,
     solana_sdk::{
         account::AccountSharedData,
         clock::Slot,
         epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
         native_token::sol_to_lamports,
         pubkey::Pubkey,
+        rent::Rent,
         rpc_port,
         signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
         system_program,
     },
+    solana_streamer::socket::SocketAddrSpace,
     solana_validator::{
-        admin_rpc_service, dashboard::Dashboard, println_name_value, redirect_stderr_to_file,
-        test_validator::*,
+        admin_rpc_service, dashboard::Dashboard, ledger_lockfile, lock_ledger, println_name_value,
+        redirect_stderr_to_file, solana_test_validator::*,
     },
     std::{
         collections::HashSet,
@@ -31,7 +34,7 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
-        sync::mpsc::channel,
+        sync::{mpsc::channel, Arc, RwLock},
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
@@ -68,7 +71,7 @@ fn main() {
                 .takes_value(true)
                 .help("Configuration file to use");
             if let Some(ref config_file) = *solana_cli_config::CONFIG_FILE {
-                arg.default_value(&config_file)
+                arg.default_value(config_file)
             } else {
                 arg
             }
@@ -153,20 +156,21 @@ fn main() {
         .arg(
             Arg::with_name("bpf_program")
                 .long("bpf-program")
-                .value_name("ADDRESS BPF_PROGRAM.SO")
+                .value_name("ADDRESS_OR_PATH BPF_PROGRAM.SO")
                 .takes_value(true)
                 .number_of_values(2)
                 .multiple(true)
                 .help(
                     "Add a BPF program to the genesis configuration. \
-                       If the ledger already exists then this parameter is silently ignored",
+                       If the ledger already exists then this parameter is silently ignored. \
+                       First argument can be a public key or path to file that can be parsed as a keypair",
                 ),
         )
         .arg(
             Arg::with_name("no_bpf_jit")
                 .long("no-bpf-jit")
                 .takes_value(false)
-                .help("Disable the just-in-time compiler and instead use the interpreter for BPF"),
+                .help("Disable the just-in-time compiler and instead use the interpreter for BPF. Windows always disables JIT."),
         )
         .arg(
             Arg::with_name("slots_per_epoch")
@@ -280,6 +284,70 @@ fn main() {
         )
         .get_matches();
 
+    let output = if matches.is_present("quiet") {
+        Output::None
+    } else if matches.is_present("log") {
+        Output::Log
+    } else {
+        Output::Dashboard
+    };
+
+    let ledger_path = value_t_or_exit!(matches, "ledger_path", PathBuf);
+    let reset_ledger = matches.is_present("reset");
+
+    if !ledger_path.exists() {
+        fs::create_dir(&ledger_path).unwrap_or_else(|err| {
+            println!(
+                "Error: Unable to create directory {}: {}",
+                ledger_path.display(),
+                err
+            );
+            exit(1);
+        });
+    }
+
+    let mut ledger_lock = ledger_lockfile(&ledger_path);
+    let _ledger_write_guard = lock_ledger(&ledger_path, &mut ledger_lock);
+    if reset_ledger {
+        remove_directory_contents(&ledger_path).unwrap_or_else(|err| {
+            println!("Error: Unable to remove {}: {}", ledger_path.display(), err);
+            exit(1);
+        })
+    }
+    solana_runtime::snapshot_utils::remove_tmp_snapshot_archives(&ledger_path);
+
+    let validator_log_symlink = ledger_path.join("validator.log");
+
+    let logfile = if output != Output::Log {
+        let validator_log_with_timestamp = format!(
+            "validator-{}.log",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        let _ = fs::remove_file(&validator_log_symlink);
+        symlink::symlink_file(&validator_log_with_timestamp, &validator_log_symlink).unwrap();
+
+        Some(
+            ledger_path
+                .join(validator_log_with_timestamp)
+                .into_os_string()
+                .into_string()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let _logger_thread = redirect_stderr_to_file(logfile);
+
+    info!("{} {}", crate_name!(), solana_version::version!());
+    info!("Starting validator with: {:#?}", std::env::args_os());
+    solana_core::validator::report_target_features();
+
+    // TODO: Ideally test-validator should *only* allow private addresses.
+    let socket_addr_space = SocketAddrSpace::new(/*allow_private_addr=*/ true);
     let cli_config = if let Some(config_file) = matches.value_of("config_file") {
         solana_cli_config::Config::load(config_file).unwrap_or_default()
     } else {
@@ -298,15 +366,6 @@ fn main() {
                 .unwrap_or_else(|_| (Keypair::new().pubkey(), true))
         });
 
-    let ledger_path = value_t_or_exit!(matches, "ledger_path", PathBuf);
-    let reset_ledger = matches.is_present("reset");
-    let output = if matches.is_present("quiet") {
-        Output::None
-    } else if matches.is_present("log") {
-        Output::Log
-    } else {
-        Output::Dashboard
-    };
     let rpc_port = value_t_or_exit!(matches, "rpc_port", u16);
     let faucet_port = value_t_or_exit!(matches, "faucet_port", u16);
     let slots_per_epoch = value_t!(matches, "slots_per_epoch", Slot).ok();
@@ -334,7 +393,6 @@ fn main() {
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         faucet_port,
     ));
-    let bpf_jit = !matches.is_present("no_bpf_jit");
 
     let mut programs = vec![];
     if let Some(values) = matches.values_of("bpf_program") {
@@ -342,10 +400,13 @@ fn main() {
         for address_program in values.chunks(2) {
             match address_program {
                 [address, program] => {
-                    let address = address.parse::<Pubkey>().unwrap_or_else(|err| {
-                        println!("Error: invalid address {}: {}", address, err);
-                        exit(1);
-                    });
+                    let address = address
+                        .parse::<Pubkey>()
+                        .or_else(|_| read_keypair_file(address).map(|keypair| keypair.pubkey()))
+                        .unwrap_or_else(|err| {
+                            println!("Error: invalid address {}: {}", address, err);
+                            exit(1);
+                        });
 
                     let program_path = PathBuf::from(program);
                     if !program_path.exists() {
@@ -389,59 +450,6 @@ fn main() {
     } else {
         None
     };
-
-    if !ledger_path.exists() {
-        fs::create_dir(&ledger_path).unwrap_or_else(|err| {
-            println!(
-                "Error: Unable to create directory {}: {}",
-                ledger_path.display(),
-                err
-            );
-            exit(1);
-        });
-    }
-
-    let mut ledger_fd_lock = FdLock::new(fs::File::open(&ledger_path).unwrap());
-    let _ledger_lock = ledger_fd_lock.try_lock().unwrap_or_else(|_| {
-        println!(
-            "Error: Unable to lock {} directory. Check if another validator is running",
-            ledger_path.display()
-        );
-        exit(1);
-    });
-
-    if reset_ledger {
-        remove_directory_contents(&ledger_path).unwrap_or_else(|err| {
-            println!("Error: Unable to remove {}: {}", ledger_path.display(), err);
-            exit(1);
-        })
-    }
-    solana_runtime::snapshot_utils::remove_tmp_snapshot_archives(&ledger_path);
-
-    let validator_log_symlink = ledger_path.join("validator.log");
-    let logfile = if output != Output::Log {
-        let validator_log_with_timestamp = format!(
-            "validator-{}.log",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
-
-        let _ = fs::remove_file(&validator_log_symlink);
-        symlink::symlink_file(&validator_log_with_timestamp, &validator_log_symlink).unwrap();
-
-        Some(
-            ledger_path
-                .join(validator_log_with_timestamp)
-                .into_os_string()
-                .into_string()
-                .unwrap(),
-        )
-    } else {
-        None
-    };
-    let _logger_thread = redirect_stderr_to_file(logfile);
 
     let faucet_lamports = sol_to_lamports(value_of(&matches, "faucet_sol").unwrap());
     let faucet_keypair_file = ledger_path.join("faucet-keypair.json");
@@ -500,6 +508,9 @@ fn main() {
     let mut genesis = TestValidatorGenesis::default();
     genesis.max_ledger_shreds = value_of(&matches, "limit_ledger_size");
 
+    let tower_storage = Arc::new(FileTowerStorage::new(ledger_path.clone()));
+
+    let admin_service_cluster_info = Arc::new(RwLock::new(None));
     admin_rpc_service::run(
         &ledger_path,
         admin_rpc_service::AdminRpcRequestMetadata {
@@ -511,6 +522,8 @@ fn main() {
             start_time: std::time::SystemTime::now(),
             validator_exit: genesis.validator_exit.clone(),
             authorized_voter_keypairs: genesis.authorized_voter_keypairs.clone(),
+            cluster_info: admin_service_cluster_info.clone(),
+            tower_storage: tower_storage.clone(),
         },
     );
     let dashboard = if output == Output::Dashboard {
@@ -528,6 +541,7 @@ fn main() {
 
     genesis
         .ledger_path(&ledger_path)
+        .tower_storage(tower_storage)
         .add_account(
             faucet_pubkey,
             AccountSharedData::new(faucet_lamports, 0, &system_program::id()),
@@ -538,7 +552,7 @@ fn main() {
             faucet_addr,
             ..JsonRpcConfig::default()
         })
-        .bpf_jit(bpf_jit)
+        .bpf_jit(!matches.is_present("no_bpf_jit"))
         .rpc_port(rpc_port)
         .add_programs_with_path(&programs);
 
@@ -561,6 +575,8 @@ fn main() {
             slots_per_epoch,
             /* enable_warmup_epochs = */ false,
         ));
+
+        genesis.rent = Rent::with_slots_per_epoch(slots_per_epoch);
     }
 
     if let Some(gossip_host) = gossip_host {
@@ -579,8 +595,9 @@ fn main() {
         genesis.bind_ip_addr(bind_address);
     }
 
-    match genesis.start_with_mint_address(mint_address) {
+    match genesis.start_with_mint_address(mint_address, socket_addr_space) {
         Ok(test_validator) => {
+            *admin_service_cluster_info.write().unwrap() = Some(test_validator.cluster_info());
             if let Some(dashboard) = dashboard {
                 dashboard.run(Duration::from_millis(250));
             }

@@ -5,11 +5,17 @@ use {
     jsonrpc_ipc_server::{RequestContext, ServerBuilder},
     jsonrpc_server_utils::tokio,
     log::*,
-    solana_core::validator::{ValidatorExit, ValidatorStartProgress},
-    solana_sdk::signature::{read_keypair_file, Keypair, Signer},
+    solana_core::{
+        consensus::Tower, tower_storage::TowerStorage, validator::ValidatorStartProgress,
+    },
+    solana_gossip::cluster_info::ClusterInfo,
+    solana_sdk::{
+        exit::Exit,
+        signature::{read_keypair_file, Keypair, Signer},
+    },
     std::{
         net::SocketAddr,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Arc, RwLock},
         thread::{self, Builder},
         time::{Duration, SystemTime},
@@ -21,8 +27,10 @@ pub struct AdminRpcRequestMetadata {
     pub rpc_addr: Option<SocketAddr>,
     pub start_time: SystemTime,
     pub start_progress: Arc<RwLock<ValidatorStartProgress>>,
-    pub validator_exit: Arc<RwLock<ValidatorExit>>,
+    pub validator_exit: Arc<RwLock<Exit>>,
     pub authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
+    pub cluster_info: Arc<RwLock<Option<Arc<ClusterInfo>>>>,
+    pub tower_storage: Arc<dyn TowerStorage>,
 }
 impl Metadata for AdminRpcRequestMetadata {}
 
@@ -50,6 +58,9 @@ pub trait AdminRpc {
 
     #[rpc(meta, name = "removeAllAuthorizedVoters")]
     fn remove_all_authorized_voters(&self, meta: Self::Metadata) -> Result<()>;
+
+    #[rpc(meta, name = "setIdentity")]
+    fn set_identity(&self, meta: Self::Metadata, keypair_file: String) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -67,7 +78,7 @@ impl AdminRpc for AdminRpcImpl {
             warn!("validator exit requested");
             meta.validator_exit.write().unwrap().exit();
 
-            // TODO: Debug why ValidatorExit doesn't always cause the validator to fully exit
+            // TODO: Debug why Exit doesn't always cause the validator to fully exit
             // (rocksdb background processing or some other stuck thread perhaps?).
             //
             // If the process is still alive after five seconds, exit harder
@@ -122,25 +133,49 @@ impl AdminRpc for AdminRpcImpl {
 
     fn remove_all_authorized_voters(&self, meta: Self::Metadata) -> Result<()> {
         debug!("remove_all_authorized_voters received");
-        let mut a = meta.authorized_voter_keypairs.write().unwrap();
-
-        error!("authorized_voter_keypairs pre len: {}", a.len());
-        a.clear();
-        error!("authorized_voter_keypairs post len: {}", a.len());
-
-        //meta.authorized_voter_keypairs.write().unwrap().clear();
+        meta.authorized_voter_keypairs.write().unwrap().clear();
         Ok(())
+    }
+
+    fn set_identity(&self, meta: Self::Metadata, keypair_file: String) -> Result<()> {
+        debug!("set_identity request received");
+
+        let identity_keypair = read_keypair_file(&keypair_file).map_err(|err| {
+            jsonrpc_core::error::Error::invalid_params(format!(
+                "Failed to read identity keypair from {}: {}",
+                keypair_file, err
+            ))
+        })?;
+
+        // Ensure a Tower exists for the new identity and exit gracefully.
+        // ReplayStage will be less forgiving if it fails to load the new tower.
+        Tower::restore(meta.tower_storage.as_ref(), &identity_keypair.pubkey()).map_err(|err| {
+            jsonrpc_core::error::Error::invalid_params(format!(
+                "Unable to load tower file for new identity: {}",
+                err
+            ))
+        })?;
+
+        if let Some(cluster_info) = meta.cluster_info.read().unwrap().as_ref() {
+            solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
+            cluster_info.set_keypair(Arc::new(identity_keypair));
+            warn!("Identity set to {}", cluster_info.id());
+            Ok(())
+        } else {
+            Err(jsonrpc_core::error::Error::invalid_params(
+                "Retry once validator start up is complete",
+            ))
+        }
     }
 }
 
 // Start the Admin RPC interface
 pub fn run(ledger_path: &Path, metadata: AdminRpcRequestMetadata) {
-    let admin_rpc_path = ledger_path.join("admin.rpc");
+    let admin_rpc_path = admin_rpc_path(ledger_path);
 
-    let event_loop = tokio::runtime::Builder::new()
-        .threaded_scheduler()
-        .enable_all()
+    let event_loop = tokio::runtime::Builder::new_multi_thread()
         .thread_name("sol-adminrpc-el")
+        .enable_all()
         .build()
         .unwrap();
 
@@ -177,9 +212,29 @@ pub fn run(ledger_path: &Path, metadata: AdminRpcRequestMetadata) {
         .unwrap();
 }
 
+fn admin_rpc_path(ledger_path: &Path) -> PathBuf {
+    #[cfg(target_family = "windows")]
+    {
+        // More information about the wackiness of pipe names over at
+        // https://docs.microsoft.com/en-us/windows/win32/ipc/pipe-names
+        if let Some(ledger_filename) = ledger_path.file_name() {
+            PathBuf::from(format!(
+                "\\\\.\\pipe\\{}-admin.rpc",
+                ledger_filename.to_string_lossy()
+            ))
+        } else {
+            PathBuf::from("\\\\.\\pipe\\admin.rpc")
+        }
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        ledger_path.join("admin.rpc")
+    }
+}
+
 // Connect to the Admin RPC interface
 pub async fn connect(ledger_path: &Path) -> std::result::Result<gen_client::Client, RpcError> {
-    let admin_rpc_path = ledger_path.join("admin.rpc");
+    let admin_rpc_path = admin_rpc_path(ledger_path);
     if !admin_rpc_path.exists() {
         Err(RpcError::Client(format!(
             "{} does not exist",

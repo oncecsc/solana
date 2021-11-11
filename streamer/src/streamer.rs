@@ -1,9 +1,12 @@
 //! The `streamer` module defines a set of services for efficiently pulling data from UDP sockets.
 //!
 
-use crate::packet::{self, send_to, Packets, PacketsRecycler, PACKETS_PER_BATCH};
-use crate::recvmmsg::NUM_RCVMMSGS;
-use solana_sdk::timing::{duration_as_ms, timestamp};
+use crate::{
+    packet::{self, send_to, Packets, PacketsRecycler, PACKETS_PER_BATCH},
+    recvmmsg::NUM_RCVMMSGS,
+    socket::SocketAddrSpace,
+};
+use solana_sdk::timing::timestamp;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
@@ -21,10 +24,10 @@ pub enum StreamerError {
     Io(#[from] std::io::Error),
 
     #[error("receive timeout error")]
-    RecvTimeoutError(#[from] RecvTimeoutError),
+    RecvTimeout(#[from] RecvTimeoutError),
 
     #[error("send packets error")]
-    SendError(#[from] SendError<Packets>),
+    Send(#[from] SendError<Packets>),
 }
 
 pub type Result<T> = std::result::Result<T, StreamerError>;
@@ -36,13 +39,18 @@ fn recv_loop(
     recycler: &PacketsRecycler,
     name: &'static str,
     coalesce_ms: u64,
+    use_pinned_memory: bool,
 ) -> Result<()> {
     let mut recv_count = 0;
     let mut call_count = 0;
     let mut now = Instant::now();
     let mut num_max_received = 0; // Number of times maximum packets were received
     loop {
-        let mut msgs = Packets::new_with_recycler(recycler.clone(), PACKETS_PER_BATCH, name);
+        let mut msgs = if use_pinned_memory {
+            Packets::new_with_recycler(recycler.clone(), PACKETS_PER_BATCH, name)
+        } else {
+            Packets::with_capacity(PACKETS_PER_BATCH)
+        };
         loop {
             // Check for exit signal, even if socket is busy
             // (for instance the leader transaction socket)
@@ -84,11 +92,10 @@ pub fn receiver(
     recycler: PacketsRecycler,
     name: &'static str,
     coalesce_ms: u64,
+    use_pinned_memory: bool,
 ) -> JoinHandle<()> {
     let res = sock.set_read_timeout(Some(Duration::new(1, 0)));
-    if res.is_err() {
-        panic!("streamer::receiver set_read_timeout error");
-    }
+    assert!(!res.is_err(), "streamer::receiver set_read_timeout error");
     let exit = exit.clone();
     Builder::new()
         .name("solana-receiver".to_string())
@@ -100,19 +107,24 @@ pub fn receiver(
                 &recycler.clone(),
                 name,
                 coalesce_ms,
+                use_pinned_memory,
             );
         })
         .unwrap()
 }
 
-fn recv_send(sock: &UdpSocket, r: &PacketReceiver) -> Result<()> {
+fn recv_send(
+    sock: &UdpSocket,
+    r: &PacketReceiver,
+    socket_addr_space: &SocketAddrSpace,
+) -> Result<()> {
     let timer = Duration::new(1, 0);
     let msgs = r.recv_timeout(timer)?;
-    send_to(&msgs, sock)?;
+    send_to(&msgs, sock, socket_addr_space)?;
     Ok(())
 }
 
-pub fn recv_batch(recvr: &PacketReceiver, max_batch: usize) -> Result<(Vec<Packets>, usize, u64)> {
+pub fn recv_batch(recvr: &PacketReceiver) -> Result<(Vec<Packets>, usize, Duration)> {
     let timer = Duration::new(1, 0);
     let msgs = recvr.recv_timeout(timer)?;
     let recv_start = Instant::now();
@@ -123,15 +135,18 @@ pub fn recv_batch(recvr: &PacketReceiver, max_batch: usize) -> Result<(Vec<Packe
         trace!("got more msgs");
         len += more.packets.len();
         batch.push(more);
-        if len > max_batch {
-            break;
-        }
     }
+    let recv_duration = recv_start.elapsed();
     trace!("batch len {}", batch.len());
-    Ok((batch, len, duration_as_ms(&recv_start.elapsed())))
+    Ok((batch, len, recv_duration))
 }
 
-pub fn responder(name: &'static str, sock: Arc<UdpSocket>, r: PacketReceiver) -> JoinHandle<()> {
+pub fn responder(
+    name: &'static str,
+    sock: Arc<UdpSocket>,
+    r: PacketReceiver,
+    socket_addr_space: SocketAddrSpace,
+) -> JoinHandle<()> {
     Builder::new()
         .name(format!("solana-responder-{}", name))
         .spawn(move || {
@@ -139,10 +154,10 @@ pub fn responder(name: &'static str, sock: Arc<UdpSocket>, r: PacketReceiver) ->
             let mut last_error = None;
             let mut last_print = 0;
             loop {
-                if let Err(e) = recv_send(&sock, &r) {
+                if let Err(e) = recv_send(&sock, &r, &socket_addr_space) {
                     match e {
-                        StreamerError::RecvTimeoutError(RecvTimeoutError::Disconnected) => break,
-                        StreamerError::RecvTimeoutError(RecvTimeoutError::Timeout) => (),
+                        StreamerError::RecvTimeout(RecvTimeoutError::Disconnected) => break,
+                        StreamerError::RecvTimeout(RecvTimeoutError::Timeout) => (),
                         _ => {
                             errors += 1;
                             last_error = Some(e);
@@ -211,10 +226,16 @@ mod test {
             Recycler::default(),
             "test",
             1,
+            true,
         );
         let t_responder = {
             let (s_responder, r_responder) = channel();
-            let t_responder = responder("streamer_send_test", Arc::new(send), r_responder);
+            let t_responder = responder(
+                "streamer_send_test",
+                Arc::new(send),
+                r_responder,
+                SocketAddrSpace::Unspecified,
+            );
             let mut msgs = Packets::default();
             for i in 0..5 {
                 let mut b = Packet::default();

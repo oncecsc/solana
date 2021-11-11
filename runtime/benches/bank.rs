@@ -32,7 +32,7 @@ const NOOP_PROGRAM_ID: [u8; 32] = [
 
 #[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
-    _program_id: &Pubkey,
+    _first_instruction_account: usize,
     _data: &[u8],
     _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
@@ -50,11 +50,11 @@ pub fn create_builtin_transactions(
             // Seed the signer account
             let rando0 = Keypair::new();
             bank_client
-                .transfer_and_confirm(10_000, &mint_keypair, &rando0.pubkey())
+                .transfer_and_confirm(10_000, mint_keypair, &rando0.pubkey())
                 .unwrap_or_else(|_| panic!("{}:{}", line!(), file!()));
 
             let instruction = create_invoke_instruction(rando0.pubkey(), program_id, &1u8);
-            let (blockhash, _fee_calculator) = bank_client.get_recent_blockhash().unwrap();
+            let blockhash = bank_client.get_latest_blockhash().unwrap();
             let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
             Transaction::new(&[&rando0], message, blockhash)
         })
@@ -72,11 +72,11 @@ pub fn create_native_loader_transactions(
             // Seed the signer account©41
             let rando0 = Keypair::new();
             bank_client
-                .transfer_and_confirm(10_000, &mint_keypair, &rando0.pubkey())
+                .transfer_and_confirm(10_000, mint_keypair, &rando0.pubkey())
                 .unwrap_or_else(|_| panic!("{}:{}", line!(), file!()));
 
             let instruction = create_invoke_instruction(rando0.pubkey(), program_id, &1u8);
-            let (blockhash, _fee_calculator) = bank_client.get_recent_blockhash().unwrap();
+            let blockhash = bank_client.get_latest_blockhash().unwrap();
             let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
             Transaction::new(&[&rando0], message, blockhash)
         })
@@ -84,7 +84,7 @@ pub fn create_native_loader_transactions(
 }
 
 fn sync_bencher(bank: &Arc<Bank>, _bank_client: &BankClient, transactions: &[Transaction]) {
-    let results = bank.process_transactions(transactions);
+    let results = bank.process_transactions(transactions.iter());
     assert!(results.iter().all(Result::is_ok));
 }
 
@@ -94,7 +94,7 @@ fn async_bencher(bank: &Arc<Bank>, bank_client: &BankClient, transactions: &[Tra
     }
     for _ in 0..1_000_000_000_u64 {
         if bank
-            .get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+            .get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
             .is_some()
         {
             break;
@@ -102,13 +102,13 @@ fn async_bencher(bank: &Arc<Bank>, bank_client: &BankClient, transactions: &[Tra
         sleep(Duration::from_nanos(1));
     }
     if bank
-        .get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+        .get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
         .unwrap()
         .is_err()
     {
         error!(
             "transaction failed: {:?}",
-            bank.get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+            bank.get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
                 .unwrap()
         );
         panic!();
@@ -124,19 +124,19 @@ fn do_bench_transactions(
     let ns_per_s = 1_000_000_000;
     let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000);
     genesis_config.ticks_per_slot = 100;
-    let mut bank = Bank::new(&genesis_config);
+    let mut bank = Bank::new_for_benches(&genesis_config);
     bank.add_builtin(
         "builtin_program",
-        Pubkey::new(&BUILTIN_PROGRAM_ID),
+        &Pubkey::new(&BUILTIN_PROGRAM_ID),
         process_instruction,
     );
-    bank.add_native_program("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID), false);
+    bank.add_builtin_account("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID), false);
     let bank = Arc::new(bank);
     let bank_client = BankClient::new_shared(&bank);
     let transactions = create_transactions(&bank_client, &mint_keypair);
 
     // Do once to fund accounts, load modules, etc...
-    let results = bank.process_transactions(&transactions);
+    let results = bank.process_transactions(transactions.iter());
     assert!(results.iter().all(Result::is_ok));
 
     bencher.iter(|| {
@@ -181,7 +181,7 @@ fn bench_bank_async_process_native_loader_transactions(bencher: &mut Bencher) {
 #[ignore]
 fn bench_bank_update_recent_blockhashes(bencher: &mut Bencher) {
     let (genesis_config, _mint_keypair) = create_genesis_config(100);
-    let mut bank = Arc::new(Bank::new(&genesis_config));
+    let mut bank = Arc::new(Bank::new_for_benches(&genesis_config));
     goto_end_of_slot(Arc::get_mut(&mut bank).unwrap());
     let genesis_hash = bank.last_blockhash();
     // Prime blockhash_queue

@@ -14,6 +14,9 @@ extern uint64_t entrypoint(const uint8_t *input) {
     return ERROR_INVALID_ARGUMENT;
   }
 
+  // on entry, return data must not be set
+  sol_assert(sol_get_return_data(NULL, 0, NULL) == 0);
+
   if (params.data_len == 0) {
     return SUCCESS;
   }
@@ -89,6 +92,12 @@ extern uint64_t entrypoint(const uint8_t *input) {
   }
   case RETURN_OK: {
     sol_log("return Ok");
+    return SUCCESS;
+  }
+  case SET_RETURN_DATA: {
+    sol_set_return_data((const uint8_t*)RETURN_DATA_VAL, sizeof(RETURN_DATA_VAL));
+    sol_log("set return data");
+    sol_assert(sol_get_return_data(NULL, 0, NULL) == sizeof(RETURN_DATA_VAL));
     return SUCCESS;
   }
   case RETURN_ERROR: {
@@ -228,16 +237,17 @@ extern uint64_t entrypoint(const uint8_t *input) {
     *accounts[INVOKED_ARGUMENT_INDEX].lamports -= 1;
     *accounts[ARGUMENT_INDEX].lamports += 1;
 
-    if (params.ka_num == 3) {
+    uint8_t remaining_invokes = params.data[1];
+    if (remaining_invokes > 1) {
+      sol_log("Invoke again");
       SolAccountMeta arguments[] = {
           {accounts[INVOKED_ARGUMENT_INDEX].key, true, true},
-          {accounts[ARGUMENT_INDEX].key, true, true}};
-      uint8_t data[] = {NESTED_INVOKE};
+          {accounts[ARGUMENT_INDEX].key, true, true},
+          {accounts[INVOKED_PROGRAM_INDEX].key, false, false}};
+      uint8_t data[] = {NESTED_INVOKE, remaining_invokes - 1};
       const SolInstruction instruction = {accounts[INVOKED_PROGRAM_INDEX].key,
                                           arguments, SOL_ARRAY_SIZE(arguments),
                                           data, SOL_ARRAY_SIZE(data)};
-
-      sol_log("Invoke again");
       sol_assert(SUCCESS == sol_invoke(&instruction, accounts, params.ka_num));
     } else {
       sol_log("Last invoked");

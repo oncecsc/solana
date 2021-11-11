@@ -1,14 +1,14 @@
-//! @brief Example Rust-based BPF program that issues a cross-program-invocation
+//! Example Rust-based BPF program that issues a cross-program-invocation
 
 #![cfg(feature = "program")]
 
-use crate::instruction::*;
+use crate::instructions::*;
 use solana_program::{
     account_info::AccountInfo,
     bpf_loader, entrypoint,
     entrypoint::{ProgramResult, MAX_PERMITTED_DATA_INCREASE},
     msg,
-    program::{invoke, invoke_signed},
+    program::{get_return_data, invoke, invoke_signed, set_return_data},
     program_error::ProgramError,
     pubkey::Pubkey,
     system_instruction,
@@ -26,6 +26,8 @@ fn process_instruction(
     if instruction_data.is_empty() {
         return Ok(());
     }
+
+    assert_eq!(get_return_data(), None);
 
     match instruction_data[0] {
         VERIFY_TRANSLATIONS => {
@@ -202,21 +204,24 @@ fn process_instruction(
             msg!("nested invoke");
             const ARGUMENT_INDEX: usize = 0;
             const INVOKED_ARGUMENT_INDEX: usize = 1;
-            const INVOKED_PROGRAM_INDEX: usize = 3;
+            const INVOKED_PROGRAM_INDEX: usize = 2;
 
             assert!(accounts[INVOKED_ARGUMENT_INDEX].is_signer);
+            assert!(instruction_data.len() > 1);
 
             **accounts[INVOKED_ARGUMENT_INDEX].lamports.borrow_mut() -= 1;
             **accounts[ARGUMENT_INDEX].lamports.borrow_mut() += 1;
-            if accounts.len() > 2 {
+            let remaining_invokes = instruction_data[1];
+            if remaining_invokes > 1 {
                 msg!("Invoke again");
                 let invoked_instruction = create_instruction(
                     *accounts[INVOKED_PROGRAM_INDEX].key,
                     &[
                         (accounts[ARGUMENT_INDEX].key, true, true),
                         (accounts[INVOKED_ARGUMENT_INDEX].key, true, true),
+                        (accounts[INVOKED_PROGRAM_INDEX].key, false, false),
                     ],
-                    vec![NESTED_INVOKE],
+                    vec![NESTED_INVOKE, remaining_invokes - 1],
                 );
                 invoke(&invoked_instruction, accounts)?;
             } else {
@@ -282,6 +287,11 @@ fn process_instruction(
                     data[i] = i as u8;
                 }
             }
+        }
+        SET_RETURN_DATA => {
+            msg!("Set return data");
+
+            set_return_data(b"Set by invoked");
         }
         _ => panic!(),
     }

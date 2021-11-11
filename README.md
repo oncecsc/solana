@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://solana.com">
-    <img alt="Solana" src="https://i.imgur.com/uBVzyX3.png" width="250" />
+    <img alt="Solana" src="https://i.imgur.com/IKyzQ6T.png" width="250" />
   </a>
 </p>
 
@@ -19,11 +19,17 @@ $ source $HOME/.cargo/env
 $ rustup component add rustfmt
 ```
 
-Please sure you are always using the latest stable rust version by running:
+When building the master branch, please make sure you are using the latest stable rust version by running:
 
 ```bash
 $ rustup update
 ```
+
+When building a specific release branch, you should check the rust version in `ci/rust-version.sh` and if necessary, install that version by running:
+```bash
+$ rustup install VERSION
+```
+Note that if this is not the latest rust version on your machine, cargo commands may require an [override](https://rust-lang.github.io/rustup/overrides.html) in order to use the correct version.
 
 On Linux systems you may need to install libssl-dev, pkg-config, zlib1g-dev, etc.  On Ubuntu:
 
@@ -49,11 +55,6 @@ $ cd solana
 
 ```bash
 $ cargo build
-```
-
-## **4. Run a minimal local cluster.**
-```bash
-$ ./run.sh
 ```
 
 # Testing
@@ -115,13 +116,13 @@ send us that patch!
 
 All claims, content, designs, algorithms, estimates, roadmaps,
 specifications, and performance measurements described in this project
-are done with the Solana Foundation's ("SF") best efforts. It is up to
+are done with the Solana Foundation's ("SF") good faith efforts. It is up to
 the reader to check and validate their accuracy and truthfulness.
-Furthermore nothing in this project constitutes a solicitation for
+Furthermore, nothing in this project constitutes a solicitation for
 investment.
 
 Any content produced by SF or developer resources that SF provides, are
-for educational and inspiration purposes only. SF does not encourage,
+for educational and inspirational purposes only. SF does not encourage,
 induce or sanction the deployment, integration or use of any such
 applications (including the code comprising the Solana blockchain
 protocol) in violation of applicable laws or regulations and hereby

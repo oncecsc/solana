@@ -8,6 +8,7 @@ use {
         QuietDisplay, VerboseDisplay,
     },
     chrono::{Local, TimeZone},
+    clap::ArgMatches,
     console::{style, Emoji},
     inflector::cases::titlecase::to_title_case,
     serde::{Deserialize, Serialize},
@@ -25,10 +26,10 @@ use {
         native_token::lamports_to_sol,
         pubkey::Pubkey,
         signature::Signature,
+        stake::state::{Authorized, Lockup},
         stake_history::StakeHistoryEntry,
         transaction::{Transaction, TransactionError},
     },
-    solana_stake_program::stake_state::{Authorized, Lockup},
     solana_transaction_status::{
         EncodedConfirmedBlock, EncodedTransaction, TransactionConfirmationStatus,
         UiTransactionStatusMeta,
@@ -47,7 +48,7 @@ use {
 
 static WARNING: Emoji = Emoji("⚠️", "!");
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum OutputFormat {
     Display,
     Json,
@@ -76,6 +77,21 @@ impl OutputFormat {
             OutputFormat::Json => serde_json::to_string_pretty(item).unwrap(),
             OutputFormat::JsonCompact => serde_json::to_value(item).unwrap().to_string(),
         }
+    }
+
+    pub fn from_matches(matches: &ArgMatches<'_>, output_name: &str, verbose: bool) -> Self {
+        matches
+            .value_of(output_name)
+            .map(|value| match value {
+                "json" => OutputFormat::Json,
+                "json-compact" => OutputFormat::JsonCompact,
+                _ => unreachable!(),
+            })
+            .unwrap_or(if verbose {
+                OutputFormat::DisplayVerbose
+            } else {
+                OutputFormat::Display
+            })
     }
 }
 
@@ -233,6 +249,10 @@ pub struct CliEpochInfo {
     pub epoch_info: EpochInfo,
     #[serde(skip)]
     pub average_slot_time_ms: u64,
+    #[serde(skip)]
+    pub start_block_time: Option<UnixTimestamp>,
+    #[serde(skip)]
+    pub current_block_time: Option<UnixTimestamp>,
 }
 
 impl QuietDisplay for CliEpochInfo {}
@@ -277,21 +297,41 @@ impl fmt::Display for CliEpochInfo {
                 remaining_slots_in_epoch
             ),
         )?;
+        let (time_elapsed, annotation) = if let (Some(start_block_time), Some(current_block_time)) =
+            (self.start_block_time, self.current_block_time)
+        {
+            (
+                Duration::from_secs((current_block_time - start_block_time) as u64),
+                None,
+            )
+        } else {
+            (
+                slot_to_duration(self.epoch_info.slot_index, self.average_slot_time_ms),
+                Some("* estimated based on current slot durations"),
+            )
+        };
+        let time_remaining = slot_to_duration(remaining_slots_in_epoch, self.average_slot_time_ms);
         writeln_name_value(
             f,
             "Epoch Completed Time:",
             &format!(
-                "{}/{} ({} remaining)",
-                slot_to_human_time(self.epoch_info.slot_index, self.average_slot_time_ms),
-                slot_to_human_time(self.epoch_info.slots_in_epoch, self.average_slot_time_ms),
-                slot_to_human_time(remaining_slots_in_epoch, self.average_slot_time_ms)
+                "{}{}/{} ({} remaining)",
+                humantime::format_duration(time_elapsed),
+                if annotation.is_some() { "*" } else { "" },
+                humantime::format_duration(time_elapsed + time_remaining),
+                humantime::format_duration(time_remaining),
             ),
-        )
+        )?;
+        if let Some(annotation) = annotation {
+            writeln!(f)?;
+            writeln!(f, "{}", annotation)?;
+        }
+        Ok(())
     }
 }
 
-fn slot_to_human_time(slot: Slot, slot_time_ms: u64) -> String {
-    humantime::format_duration(Duration::from_secs((slot * slot_time_ms) / 1000)).to_string()
+fn slot_to_duration(slot: Slot, slot_time_ms: u64) -> Duration {
+    Duration::from_secs((slot * slot_time_ms) / 1000)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -323,6 +363,8 @@ pub struct CliValidators {
     pub total_current_stake: u64,
     pub total_delinquent_stake: u64,
     pub validators: Vec<CliValidator>,
+    pub average_skip_rate: f64,
+    pub average_stake_weighted_skip_rate: f64,
     #[serde(skip_serializing)]
     pub validators_sort_order: CliValidatorsSortOrder,
     #[serde(skip_serializing)]
@@ -489,6 +531,18 @@ impl fmt::Display for CliValidators {
         writeln!(f)?;
         writeln_name_value(
             f,
+            "Average Stake-Weighted Skip Rate:",
+            &format!("{:.2}%", self.average_stake_weighted_skip_rate,),
+        )?;
+        writeln_name_value(
+            f,
+            "Average Unweighted Skip Rate:    ",
+            &format!("{:.2}%", self.average_skip_rate),
+        )?;
+
+        writeln!(f)?;
+        writeln_name_value(
+            f,
             "Active Stake:",
             &build_balance_message(self.total_active_stake, self.use_lamports_unit, true),
         )?;
@@ -522,7 +576,7 @@ impl fmt::Display for CliValidators {
         for (version, info) in self.stake_by_version.iter() {
             writeln!(
                 f,
-                "{:<8} - {:3} current validators ({:>5.2}%){}",
+                "{:<8} - {:4} current validators ({:>5.2}%){}",
                 version,
                 info.current_validators,
                 100. * info.current_active_stake as f64 / self.total_active_stake as f64,
@@ -733,6 +787,7 @@ pub struct CliEpochReward {
     pub post_balance: u64, // lamports
     pub percent_change: f64,
     pub apr: Option<f64>,
+    pub commission: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -777,23 +832,27 @@ impl fmt::Display for CliKeyedEpochRewards {
         writeln!(f, "Epoch Rewards:")?;
         writeln!(
             f,
-            "  {:<44}  {:<18}  {:<18}  {:>14}  {:>14}",
-            "Address", "Amount", "New Balance", "Percent Change", "APR"
+            "  {:<44}  {:<18}  {:<18}  {:>14}  {:>14}  {:>10}",
+            "Address", "Amount", "New Balance", "Percent Change", "APR", "Commission"
         )?;
         for keyed_reward in &self.rewards {
             match &keyed_reward.reward {
                 Some(reward) => {
                     writeln!(
                         f,
-                        "  {:<44}  ◎{:<17.9}  ◎{:<17.9}  {:>13.2}%  {}",
+                        "  {:<44}  ◎{:<17.9}  ◎{:<17.9}  {:>13.9}%  {:>14}  {:>10}",
                         keyed_reward.address,
                         lamports_to_sol(reward.amount),
                         lamports_to_sol(reward.post_balance),
                         reward.percent_change,
                         reward
                             .apr
-                            .map(|apr| format!("{:>13.2}%", apr))
+                            .map(|apr| format!("{:.2}%", apr))
                             .unwrap_or_default(),
+                        reward
+                            .commission
+                            .map(|commission| format!("{}%", commission))
+                            .unwrap_or_else(|| "-".to_string())
                     )?;
                 }
                 None => {
@@ -910,13 +969,13 @@ fn show_epoch_rewards(
         writeln!(f, "Epoch Rewards:")?;
         writeln!(
             f,
-            "  {:<6}  {:<11}  {:<18}  {:<18}  {:>14}  {:>14}",
-            "Epoch", "Reward Slot", "Amount", "New Balance", "Percent Change", "APR"
+            "  {:<6}  {:<11}  {:<18}  {:<18}  {:>14}  {:>14}  {:>10}",
+            "Epoch", "Reward Slot", "Amount", "New Balance", "Percent Change", "APR", "Commission"
         )?;
         for reward in epoch_rewards {
             writeln!(
                 f,
-                "  {:<6}  {:<11}  ◎{:<17.9}  ◎{:<17.9}  {:>13.2}%  {}",
+                "  {:<6}  {:<11}  ◎{:<17.9}  ◎{:<17.9}  {:>13.9}%  {:>14}  {:>10}",
                 reward.epoch,
                 reward.effective_slot,
                 lamports_to_sol(reward.amount),
@@ -924,8 +983,12 @@ fn show_epoch_rewards(
                 reward.percent_change,
                 reward
                     .apr
-                    .map(|apr| format!("{:>13.2}%", apr))
+                    .map(|apr| format!("{:.2}%", apr))
                     .unwrap_or_default(),
+                reward
+                    .commission
+                    .map(|commission| format!("{}%", commission))
+                    .unwrap_or_else(|| "-".to_string())
             )?;
         }
     }
@@ -1287,7 +1350,7 @@ impl fmt::Display for CliValidatorInfo {
             writeln_name_value(
                 f,
                 &format!("  {}:", to_title_case(key)),
-                &value.as_str().unwrap_or("?"),
+                value.as_str().unwrap_or("?"),
             )?;
         }
         Ok(())
@@ -1325,8 +1388,8 @@ impl fmt::Display for CliVoteAccount {
             build_balance_message(self.account_balance, self.use_lamports_unit, true)
         )?;
         writeln!(f, "Validator Identity: {}", self.validator_identity)?;
-        writeln!(f, "Authorized Voters: {}", self.authorized_voters)?;
-        writeln!(f, "Authorized Withdrawer: {}", self.authorized_withdrawer)?;
+        writeln!(f, "Vote Authority: {}", self.authorized_voters)?;
+        writeln!(f, "Withdraw Authority: {}", self.authorized_withdrawer)?;
         writeln!(f, "Credits: {}", self.credits)?;
         writeln!(f, "Commission: {}%", self.commission)?;
         writeln!(
@@ -1513,15 +1576,19 @@ impl fmt::Display for CliInflation {
             "Staking rate:            {:>5.2}%",
             self.current_rate.validator * 100.
         )?;
-        writeln!(
-            f,
-            "Foundation rate:         {:>5.2}%",
-            self.current_rate.foundation * 100.
-        )
+
+        if self.current_rate.foundation > 0. {
+            writeln!(
+                f,
+                "Foundation rate:         {:>5.2}%",
+                self.current_rate.foundation * 100.
+            )?;
+        }
+        Ok(())
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CliSignOnlyData {
     pub blockhash: String,
@@ -1669,6 +1736,7 @@ pub struct CliFeesInner {
     pub blockhash: String,
     pub lamports_per_signature: u64,
     pub last_valid_slot: Option<Slot>,
+    pub last_valid_block_height: Option<Slot>,
 }
 
 impl QuietDisplay for CliFeesInner {}
@@ -1682,11 +1750,11 @@ impl fmt::Display for CliFeesInner {
             "Lamports per signature:",
             &self.lamports_per_signature.to_string(),
         )?;
-        let last_valid_slot = self
-            .last_valid_slot
+        let last_valid_block_height = self
+            .last_valid_block_height
             .map(|s| s.to_string())
             .unwrap_or_default();
-        writeln_name_value(f, "Last valid slot:", &last_valid_slot)
+        writeln_name_value(f, "Last valid block height:", &last_valid_block_height)
     }
 }
 
@@ -1715,6 +1783,7 @@ impl CliFees {
         blockhash: Hash,
         lamports_per_signature: u64,
         last_valid_slot: Option<Slot>,
+        last_valid_block_height: Option<Slot>,
     ) -> Self {
         Self {
             inner: Some(CliFeesInner {
@@ -1722,6 +1791,7 @@ impl CliFees {
                 blockhash: blockhash.to_string(),
                 lamports_per_signature,
                 last_valid_slot,
+                last_valid_block_height,
             }),
         }
     }
@@ -1768,7 +1838,7 @@ impl fmt::Display for CliTokenAccount {
         writeln_name_value(
             f,
             "Close authority:",
-            &account.close_authority.as_ref().unwrap_or(&String::new()),
+            account.close_authority.as_ref().unwrap_or(&String::new()),
         )?;
         Ok(())
     }
@@ -1860,6 +1930,9 @@ pub struct CliUpgradeableProgram {
     pub authority: String,
     pub last_deploy_slot: u64,
     pub data_len: usize,
+    pub lamports: u64,
+    #[serde(skip_serializing)]
+    pub use_lamports_unit: bool,
 }
 impl QuietDisplay for CliUpgradeableProgram {}
 impl VerboseDisplay for CliUpgradeableProgram {}
@@ -1880,11 +1953,77 @@ impl fmt::Display for CliUpgradeableProgram {
             "Data Length:",
             &format!("{:?} ({:#x?}) bytes", self.data_len, self.data_len),
         )?;
+        writeln_name_value(
+            f,
+            "Balance:",
+            &build_balance_message(self.lamports, self.use_lamports_unit, true),
+        )?;
         Ok(())
     }
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliUpgradeablePrograms {
+    pub programs: Vec<CliUpgradeableProgram>,
+    #[serde(skip_serializing)]
+    pub use_lamports_unit: bool,
+}
+impl QuietDisplay for CliUpgradeablePrograms {}
+impl VerboseDisplay for CliUpgradeablePrograms {}
+impl fmt::Display for CliUpgradeablePrograms {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln!(
+            f,
+            "{}",
+            style(format!(
+                "{:<44} | {:<9} | {:<44} | {}",
+                "Program Id", "Slot", "Authority", "Balance"
+            ))
+            .bold()
+        )?;
+        for program in self.programs.iter() {
+            writeln!(
+                f,
+                "{}",
+                &format!(
+                    "{:<44} | {:<9} | {:<44} | {}",
+                    program.program_id,
+                    program.last_deploy_slot,
+                    program.authority,
+                    build_balance_message(program.lamports, self.use_lamports_unit, true)
+                )
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliUpgradeableProgramClosed {
+    pub program_id: String,
+    pub lamports: u64,
+    #[serde(skip_serializing)]
+    pub use_lamports_unit: bool,
+}
+impl QuietDisplay for CliUpgradeableProgramClosed {}
+impl VerboseDisplay for CliUpgradeableProgramClosed {}
+impl fmt::Display for CliUpgradeableProgramClosed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Closed Program Id {}, {} reclaimed",
+            &self.program_id,
+            &build_balance_message(self.lamports, self.use_lamports_unit, true)
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliUpgradeableBuffer {
     pub address: String,
@@ -1970,6 +2109,11 @@ pub fn return_signers_with_config(
     output_format: &OutputFormat,
     config: &ReturnSignersConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let cli_command = return_signers_data(tx, config);
+    Ok(output_format.formatted_string(&cli_command))
+}
+
+pub fn return_signers_data(tx: &Transaction, config: &ReturnSignersConfig) -> CliSignOnlyData {
     let verify_results = tx.verify_with_results();
     let mut signers = Vec::new();
     let mut absent = Vec::new();
@@ -1994,19 +2138,17 @@ pub fn return_signers_with_config(
         None
     };
 
-    let cli_command = CliSignOnlyData {
+    CliSignOnlyData {
         blockhash: tx.message.recent_blockhash.to_string(),
         message,
         signers,
         absent,
         bad_sig,
-    };
-
-    Ok(output_format.formatted_string(&cli_command))
+    }
 }
 
 pub fn parse_sign_only_reply_string(reply: &str) -> SignOnly {
-    let object: Value = serde_json::from_str(&reply).unwrap();
+    let object: Value = serde_json::from_str(reply).unwrap();
     let blockhash_str = object.get("blockhash").unwrap().as_str().unwrap();
     let blockhash = blockhash_str.parse::<Hash>().unwrap();
     let mut present_signers: Vec<(Pubkey, Signature)> = Vec::new();
@@ -2136,8 +2278,8 @@ impl fmt::Display for CliBlock {
             writeln!(f, "Rewards:")?;
             writeln!(
                 f,
-                "  {:<44}  {:^15}  {:<15}  {:<20}  {:>14}",
-                "Address", "Type", "Amount", "New Balance", "Percent Change"
+                "  {:<44}  {:^15}  {:<15}  {:<20}  {:>14}  {:>10}",
+                "Address", "Type", "Amount", "New Balance", "Percent Change", "Commission"
             )?;
             for reward in rewards {
                 let sign = if reward.lamports < 0 { "-" } else { "" };
@@ -2145,7 +2287,7 @@ impl fmt::Display for CliBlock {
                 total_rewards += reward.lamports;
                 writeln!(
                     f,
-                    "  {:<44}  {:^15}  {:>15}  {}",
+                    "  {:<44}  {:^15}  {:>15}  {}  {}",
                     reward.pubkey,
                     if let Some(reward_type) = reward.reward_type {
                         format!("{}", reward_type)
@@ -2167,7 +2309,11 @@ impl fmt::Display for CliBlock {
                                 / (reward.post_balance as f64 - reward.lamports as f64))
                                 * 100.0
                         )
-                    }
+                    },
+                    reward
+                        .commission
+                        .map(|commission| format!("{:>9}%", commission))
+                        .unwrap_or_else(|| "    -".to_string())
                 )?;
             }
 
@@ -2380,6 +2526,7 @@ impl VerboseDisplay for CliGossipNodes {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{App, Arg};
     use solana_sdk::{
         message::Message,
         pubkey::Pubkey,
@@ -2407,6 +2554,10 @@ mod tests {
 
             fn try_sign_message(&self, _message: &[u8]) -> Result<Signature, SignerError> {
                 Ok(Signature::new(&[1u8; 64]))
+            }
+
+            fn is_interactive(&self) -> bool {
+                false
             }
         }
 
@@ -2436,6 +2587,18 @@ mod tests {
         assert_eq!(sign_only.absent_signers[0], absent.pubkey());
         assert_eq!(sign_only.bad_signers[0], bad.pubkey());
 
+        let res_data = return_signers_data(&tx, &ReturnSignersConfig::default());
+        assert_eq!(
+            res_data,
+            CliSignOnlyData {
+                blockhash: blockhash.to_string(),
+                message: None,
+                signers: vec![format!("{}={}", present.pubkey(), tx.signatures[1])],
+                absent: vec![absent.pubkey().to_string()],
+                bad_sig: vec![bad.pubkey().to_string()],
+            }
+        );
+
         let expected_msg = "AwECBwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDgTl3Dqh9\
             F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\
             BAQEBAYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBQUFBQUFBQUFBQUFBQUFBQUF\
@@ -2449,10 +2612,22 @@ mod tests {
         let res = return_signers_with_config(&tx, &OutputFormat::JsonCompact, &config).unwrap();
         let sign_only = parse_sign_only_reply_string(&res);
         assert_eq!(sign_only.blockhash, blockhash);
-        assert_eq!(sign_only.message, Some(expected_msg));
+        assert_eq!(sign_only.message, Some(expected_msg.clone()));
         assert_eq!(sign_only.present_signers[0].0, present.pubkey());
         assert_eq!(sign_only.absent_signers[0], absent.pubkey());
         assert_eq!(sign_only.bad_signers[0], bad.pubkey());
+
+        let res_data = return_signers_data(&tx, &config);
+        assert_eq!(
+            res_data,
+            CliSignOnlyData {
+                blockhash: blockhash.to_string(),
+                message: Some(expected_msg),
+                signers: vec![format!("{}={}", present.pubkey(), tx.signatures[1])],
+                absent: vec![absent.pubkey().to_string()],
+                bad_sig: vec![bad.pubkey().to_string()],
+            }
+        );
     }
 
     #[test]
@@ -2499,6 +2674,52 @@ mod tests {
         assert_eq!(
             &OutputFormat::DisplayVerbose.formatted_string(&f),
             "verbose"
+        );
+    }
+
+    #[test]
+    fn test_output_format_from_matches() {
+        let app = App::new("test").arg(
+            Arg::with_name("output_format")
+                .long("output")
+                .value_name("FORMAT")
+                .global(true)
+                .takes_value(true)
+                .possible_values(&["json", "json-compact"])
+                .help("Return information in specified output format"),
+        );
+        let matches = app
+            .clone()
+            .get_matches_from(vec!["test", "--output", "json"]);
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", false),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", true),
+            OutputFormat::Json
+        );
+
+        let matches = app
+            .clone()
+            .get_matches_from(vec!["test", "--output", "json-compact"]);
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", false),
+            OutputFormat::JsonCompact
+        );
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", true),
+            OutputFormat::JsonCompact
+        );
+
+        let matches = app.clone().get_matches_from(vec!["test"]);
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", false),
+            OutputFormat::Display
+        );
+        assert_eq!(
+            OutputFormat::from_matches(&matches, "output_format", true),
+            OutputFormat::DisplayVerbose
         );
     }
 }

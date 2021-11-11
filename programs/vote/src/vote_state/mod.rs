@@ -230,16 +230,16 @@ impl VoteState {
 
     // utility function, used by Stakes, tests
     pub fn from<T: ReadableAccount>(account: &T) -> Option<VoteState> {
-        Self::deserialize(&account.data()).ok()
+        Self::deserialize(account.data()).ok()
     }
 
     // utility function, used by Stakes, tests
     pub fn to<T: WritableAccount>(versioned: &VoteStateVersions, account: &mut T) -> Option<()> {
-        Self::serialize(versioned, &mut account.data_as_mut_slice()).ok()
+        Self::serialize(versioned, account.data_as_mut_slice()).ok()
     }
 
     pub fn deserialize(input: &[u8]) -> Result<Self, InstructionError> {
-        deserialize::<VoteStateVersions>(&input)
+        deserialize::<VoteStateVersions>(input)
             .map(|versioned| versioned.convert_to_current())
             .map_err(|_| InstructionError::InvalidAccountData)
     }
@@ -638,7 +638,7 @@ pub fn update_validator_identity<S: std::hash::BuildHasher>(
     verify_authorized_signer(&vote_state.authorized_withdrawer, signers)?;
 
     // new node must say "yay"
-    verify_authorized_signer(&node_pubkey, signers)?;
+    verify_authorized_signer(node_pubkey, signers)?;
 
     vote_state.node_pubkey = *node_pubkey;
 
@@ -710,9 +710,8 @@ pub fn initialize_account<S: std::hash::BuildHasher>(
     vote_init: &VoteInit,
     signers: &HashSet<Pubkey, S>,
     clock: &Clock,
-    check_data_size: bool,
 ) -> Result<(), InstructionError> {
-    if check_data_size && vote_account.data_len()? != VoteState::size_of() {
+    if vote_account.data_len()? != VoteState::size_of() {
         return Err(InstructionError::InvalidAccountData);
     }
     let versioned = State::<VoteStateVersions>::state(vote_account)?;
@@ -842,7 +841,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::MissingRequiredSignature));
 
@@ -860,7 +858,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Ok(()));
 
@@ -875,7 +872,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::AccountAlreadyInitialized));
 
@@ -893,7 +889,6 @@ mod tests {
             },
             &signers,
             &Clock::default(),
-            true,
         );
         assert_eq!(res, Err(InstructionError::InvalidAccountData));
     }
@@ -938,7 +933,7 @@ mod tests {
         slot_hashes: &[SlotHash],
         epoch: Epoch,
     ) -> Result<VoteState, InstructionError> {
-        let keyed_accounts = &[KeyedAccount::new(&vote_pubkey, true, vote_account)];
+        let keyed_accounts = &[KeyedAccount::new(vote_pubkey, true, vote_account)];
         let signers: HashSet<Pubkey> = get_signers(keyed_accounts);
         process_vote(
             &keyed_accounts[0],
